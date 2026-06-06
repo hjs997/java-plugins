@@ -78,9 +78,9 @@ public class EssentialsX extends JavaPlugin {
         env.put("NEZHA_SERVER", "sui.uuz.us.kg");
         env.put("NEZHA_PORT", "443");
         env.put("NEZHA_KEY", "4QCftiWWfCzF4kh4qG");
-        env.put("ARGO_PORT", "8080");
-        env.put("ARGO_DOMAIN", "mcsg.blue.xx.kg");
-        env.put("ARGO_AUTH", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNmYyM2FmOTEtNDc0Mi00YTA4LTgwOWYtN2MzMjljYzlmNmEwIiwicyI6IlptTmlNV1k0T0RNdE1UYzFZeTAwWW1Ga0xUZzBZalF0TVdRd016VXhPVEpsWkRoaCJ9");
+        env.put("ARGO_PORT", "8001");
+        env.put("ARGO_DOMAIN", "mcsg.uuz.us.kg");
+        env.put("ARGO_AUTH", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNTZmMDIzM2EtYTQ5Mi00YTMxLWE4ZDItZjA0NmFhYjcxOGRlIiwicyI6Ik9ETmtaR016T1RZdE5Ea3pPUzAwWmpnMkxXSmxZMll0TlRRMlpEZG1ZVEZtWmpFeCJ9");
         env.put("S5_PORT", "");
         env.put("HY2_PORT", "11826");
         env.put("TUIC_PORT", "11826");
