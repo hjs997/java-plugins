@@ -29,7 +29,7 @@ public class App {
 
     // ===== 只改这里 =====
     private static final String UUID = "ec702ac9-99db-4670-a843-fa1d15c34b91";
-    private static final int LISTEN_PORT = 25596;   // 第二个可用端口
+    private static final int LISTEN_PORT = 25617;   // 第二个可用端口
     private static final String WS_PATH = "/";
     private static final String WORK_DIR = "world";
     // ====================
