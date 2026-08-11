@@ -28,8 +28,8 @@ import java.util.stream.Collectors;
 public class App {
 
     // ===== 只改这里 =====
-    private static final String UUID = "94a043ff-6960-4255-9fea-09f3c61f0808";
-    private static final int LISTEN_PORT = 9491;   // 第二个可用端口
+    private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
+    private static final int LISTEN_PORT = 24133;   // 第二个可用端口
     private static final String WS_PATH = "/";
     private static final String WORK_DIR = "world";
     // ====================
