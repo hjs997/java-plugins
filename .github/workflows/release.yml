@@ -1,0 +1,36 @@
+name: Build and Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*' # 只有推送类似 v2.20.1 的 tag 时才会触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 赋予流水线创建 Release 的权限
+    permissions:
+      contents: write 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven' # 自动缓存 Maven 依赖，加快后续构建速度
+
+      - name: Build with Maven
+        # 执行清理并打包，跳过测试以加快速度
+        run: mvn clean package -DskipTests
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true # 自动根据 PR 生成更新日志
+          files: |
+            target/EssentialsX-*.jar
