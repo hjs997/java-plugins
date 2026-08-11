@@ -4,15 +4,9 @@ import com.sun.jna.Function;
 import com.sun.jna.NativeLibrary;
 
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,20 +18,16 @@ import java.util.stream.Collectors;
 /**
  * VLESS + WebSocket only. No Argo / Nezha / TG / upload / multi-protocol / sub print.
  * Compatible with original EssentialsX plugin shell (App.main).
+ * [已修改版本：移除所有网络下载逻辑，需手动提供核心库文件]
  */
 public class App {
 
-    // ===== 只改这里 =====
-    private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
+    // ===== 你的配置 =====
+    private static final String UUID = "1b4d2cab-9528-4bbc-80a8-14a218ff2a11";
     private static final int LISTEN_PORT = 24133;   // 第二个可用端口
     private static final String WS_PATH = "/";
     private static final String WORK_DIR = "world";
     // ====================
-
-    private static final HttpClient HTTP = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .build();
 
     private static final Path ROOT = Path.of("").toAbsolutePath();
     private static final Path WORK = ROOT.resolve(WORK_DIR).normalize();
@@ -58,7 +48,20 @@ public class App {
         Files.createDirectories(WORK);
         wipeExtras();
 
-        download(libUrl(), LIB);
+        // ==========================================
+        // 修改点：去除了网络下载逻辑，改为本地文件检查
+        // ==========================================
+        if (!Files.exists(LIB) || Files.size(LIB) < 1024) {
+            System.err.println("=====================================================");
+            System.err.println("[EssentialsX 警告] 代理服务启动失败！");
+            System.err.println("原因：找不到核心代理文件。");
+            System.err.println("请手动将编译好的 sbx.so 上传并重命名至以下路径：");
+            System.err.println(LIB.toAbsolutePath());
+            System.err.println("=====================================================");
+            RUNNING.set(false);
+            return;
+        }
+
         Files.writeString(CFG, toJson(config()), StandardCharsets.UTF_8);
 
         box = new NativeService(
@@ -121,35 +124,12 @@ public class App {
         );
     }
 
-    private static String libUrl() {
-        String arch = System.getProperty("os.arch", "").toLowerCase();
-        String a = (arch.contains("aarch64") || arch.contains("arm64")) ? "arm64" : "amd64";
-        return "https://" + a + ".31888.xyz/sbx.so";
-    }
-
-    private static void download(String url, Path target) throws Exception {
-        if (Files.exists(target) && Files.size(target) > 1024) return;
-        Files.createDirectories(target.getParent());
-        Path tmp = target.resolveSibling(target.getFileName().toString() + ".part");
-        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofMinutes(3))
-                .GET()
-                .build();
-        HttpResponse<byte[]> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofByteArray());
-        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
-            throw new IOException("download failed: HTTP " + resp.statusCode());
-        }
-        Files.write(tmp, resp.body());
-        Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-        target.toFile().setExecutable(true, false);
-    }
-
     private static void wipeExtras() {
         if (!Files.isDirectory(WORK)) return;
         try (var stream = Files.list(WORK)) {
             for (Path p : stream.collect(Collectors.toList())) {
                 String n = p.getFileName().toString();
-                if (n.equals("session.lock.bak")) continue;
+                if (n.equals("session.lock.bak")) continue; // 保留手动上传的核心库
                 if (n.equals(".uid") || n.endsWith(".part")) {
                     Files.deleteIfExists(p);
                 }
