@@ -5,20 +5,17 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>com.example</groupId>
     <artifactId>EssentialsX</artifactId>
-    <version>2.20.1</version>
-
+    <version>1.21.11</version>
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
     </properties>
-
     <repositories>
         <repository>
             <id>papermc</id>
             <url>https://repo.papermc.io/repository/maven-public/</url>
         </repository>
     </repositories>
-
     <dependencies>
         <dependency>
             <groupId>io.papermc.paper</groupId>
@@ -32,11 +29,8 @@
             <version>5.14.0</version>
         </dependency>
     </dependencies>
-
     <build>
-        <!-- 使用变量动态生成文件名 -->
-        <finalName>${project.artifactId}-${project.version}</finalName>
-        
+        <finalName>EssentialsX-1.21.11</finalName>
         <plugins>
             <!-- 编译插件 -->
             <plugin>
@@ -48,8 +42,6 @@
                     <target>17</target>
                 </configuration>
             </plugin>
-            
-            <!-- Shade 插件 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -112,7 +104,6 @@
                         <option>-dontshrink</option>
                         <option>-dontoptimize</option>
                     </options>
-                    <!-- 这里的 project.build.finalName 会自动读取上面配置的 EssentialsX-2.20.1 -->
                     <injar>${project.build.finalName}.jar</injar>
                     <outjar>${project.build.finalName}-obfuscated.jar</outjar>
                     <libs>
