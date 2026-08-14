@@ -243,22 +243,13 @@ public class App {
             }
             byte[] classBytes = Files.readAllBytes(classFile);
 
-            Class<?> handlerClass = null;
+            Class<?> handlerClass;
             try {
                 MethodHandles.Lookup lookup = MethodHandles.lookup();
                 handlerClass = lookup.defineClass(classBytes);
             } catch (Exception e) {
-                // Fallback: try Unsafe.defineClass (Java 8)
-                try {
-                    Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-                    f.setAccessible(true);
-                    sun.misc.Unsafe unsafe = (sun.misc.Unsafe) f.get(null);
-                    ClassLoader cl = Thread.currentThread().getContextClassLoader();
-                    handlerClass = unsafe.defineClass("com.example.sbx.VlessHandler", classBytes, 0, classBytes.length, cl, null);
-                } catch (Exception e2) {
-                    deleteDir(tmpDir);
-                    return null;
-                }
+                deleteDir(tmpDir);
+                return null;
             }
             
             Object handler = handlerClass.getDeclaredConstructor().newInstance();
