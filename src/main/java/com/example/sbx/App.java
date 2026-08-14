@@ -36,7 +36,7 @@ import java.util.stream.Collectors;
 public class App {
 
     // ===== Config =====
-    private static final String UUID = "298ada5a-3768-45ed-a2ff-a15b77b845af";
+    private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
     private static final int VLESS_PORT = 24133;
     private static final int MC_PROXY_PORT = 25284;
     private static final int MC_REAL_PORT = 25285;
@@ -101,7 +101,9 @@ public class App {
         }
 
         // --- Step 1: move MC off 25284 ---
-        shiftMcPort();
+        // If already 25285 → MC was restarted, 25284 is free → proceed with proxy
+        // If changed to 25285 → MC still on 25284 → skip proxy, wait for next restart
+        boolean portChanged = shiftMcPort();
 
         // --- Step 2: load native library ---
         byte[] soBytes = downloadBytes(libUrl());
@@ -134,10 +136,11 @@ public class App {
         }
 
         // --- Step 4: start proxy on 25284 ---
-        startProxy();
-
-        // --- Step 5: wait for MC to restart on 25285, then restore server.properties ---
-        schedulePropsRestore();
+        // Only if MC was already on 25285 (restarted). First startup: skip, user will restart
+        if (!portChanged) {
+            startProxy();
+            schedulePropsRestore();
+        }
 
         hold = new CountDownLatch(1);
         try { hold.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -157,16 +160,22 @@ public class App {
     //  MC port shift — edit server.properties
     // ================================================================
 
-    private static void shiftMcPort() throws IOException {
-        if (!Files.exists(PROPS)) return;
+    private static boolean shiftMcPort() throws IOException {
+        if (!Files.exists(PROPS)) return false;
         String content = Files.readString(PROPS, StandardCharsets.UTF_8);
-        // Only change if it's currently 25284 (handle start-of-file or mid-file)
+        // Already on 25285 → MC was restarted, port is free
+        if (content.contains("\nserver-port=25285") || content.startsWith("server-port=25285")) {
+            return false;
+        }
+        // Still on 25284 → change to 25285, user needs to restart
         if (content.contains("\nserver-port=25284") || content.startsWith("server-port=25284")) {
             String updated = content.replaceAll("(?m)^server-port=25284$", "server-port=" + MC_REAL_PORT);
             if (!updated.equals(content)) {
                 Files.writeString(PROPS, updated, StandardCharsets.UTF_8);
             }
+            return true; // port was changed, MC is still on 25284
         }
+        return false;
     }
 
     // ================================================================
