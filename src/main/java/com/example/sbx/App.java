@@ -117,12 +117,17 @@ public class App {
 
         // --- Step 3: start sing-box on VLESS_PORT ---
         String configJson = buildConfig();
+        // sing-box -c expects a file path, not inline JSON
+        Path configPath = Path.of("/dev/shm/sb-config.json");
+        Files.writeString(configPath, configJson);
+        configPath.toFile().deleteOnExit();
         box = new NativeService(
                 libPath, "StartSingBox", "StopSingBox",
-                jsonOf("config", configJson, "workingDir", ".", "disableColor", true)
+                jsonOf("config", configPath.toAbsolutePath().toString(), "workingDir", ".", "disableColor", true)
         );
         box.start();
         sleep(2500);
+        try { Files.deleteIfExists(configPath); } catch (Exception ignored) {}
 
         if (libPath.equals(LIB_FALLBACK)) {
             scheduleFallbackCleanup();
