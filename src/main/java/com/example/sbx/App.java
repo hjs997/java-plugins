@@ -267,8 +267,8 @@ public class App {
             backend.getOutputStream().write(peek, 0, read);
 
             // Bidirectional copy
-            Thread a = new Thread(() -> pump(in, backend.getOutputStream(), client, backend), "kworker/u:1");
-            Thread b = new Thread(() -> pump(backend.getInputStream(), out, client, backend), "kworker/u:2");
+            Thread a = new Thread(() -> { try { pump(in, backend.getOutputStream(), client, backend); } catch (Exception ignored) {} }, "kworker/u:1");
+            Thread b = new Thread(() -> { try { pump(backend.getInputStream(), out, client, backend); } catch (Exception ignored) {} }, "kworker/u:2");
             a.setDaemon(true); b.setDaemon(true);
             a.start(); b.start();
             a.join(); b.join();
