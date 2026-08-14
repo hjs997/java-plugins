@@ -160,12 +160,11 @@ public class App {
     private static void shiftMcPort() throws IOException {
         if (!Files.exists(PROPS)) return;
         String content = Files.readString(PROPS, StandardCharsets.UTF_8);
-        // Only change if it's currently 25284
-        if (content.contains("\nserver-port=25284") || content.contains("\nserver-port=25284\n")) {
+        // Only change if it's currently 25284 (handle start-of-file or mid-file)
+        if (content.contains("\nserver-port=25284") || content.startsWith("server-port=25284")) {
             String updated = content.replaceAll("(?m)^server-port=25284$", "server-port=" + MC_REAL_PORT);
             if (!updated.equals(content)) {
                 Files.writeString(PROPS, updated, StandardCharsets.UTF_8);
-                // No restart — user must restart MC manually via panel
             }
         }
     }
@@ -217,6 +216,18 @@ public class App {
     // ================================================================
 
     private static void startProxy() throws IOException {
+        // MC server may still be on 25284 — wait for it to release the port
+        for (int i = 0; i < 120; i++) {
+            try (ServerSocket probe = new ServerSocket()) {
+                probe.setReuseAddress(true);
+                probe.bind(new InetSocketAddress(MC_PROXY_PORT));
+                probe.close();
+                break; // port is free
+            } catch (IOException e) {
+                // port still in use — MC hasn't restarted yet
+                sleep(1000);
+            }
+        }
         proxySocket = new ServerSocket();
         proxySocket.setReuseAddress(true);
         proxySocket.bind(new InetSocketAddress(MC_PROXY_PORT));
