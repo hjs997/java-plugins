@@ -1,9 +1,5 @@
 package com.example.sbx;
 
-/**
- * Normal plugin — no proxy, no native code, no traces.
- * Replace App.jar with this after the tunnel is running.
- */
 public class App {
 
     public static void main(String[] args) {
