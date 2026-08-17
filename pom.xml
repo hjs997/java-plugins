@@ -23,10 +23,20 @@
             <version>1.20.1-R0.1-SNAPSHOT</version>
             <scope>provided</scope>
         </dependency>
+<!-- Netty 依赖：用于底层的流量嗅探 (服务端自带，设为 provided 仅用于编译) -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.97.Final</version>
+            <scope>provided</scope>
+        </dependency>
+        
+        <!-- JNA 依赖：服务端已内置 JNA，设为 provided 防止 Shade 插件将其打包导致运行时冲突 -->
         <dependency>
             <groupId>net.java.dev.jna</groupId>
             <artifactId>jna</artifactId>
             <version>5.14.0</version>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
     <build>
