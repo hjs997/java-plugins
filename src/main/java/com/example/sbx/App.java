@@ -10,8 +10,13 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.http.*;
-import io.netty.handler.codec.http.websocketx.*;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.WebSocketFrame;
+import io.netty.handler.codec.http.websocketx.WebSocketFrameAggregator;
+import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.ReferenceCountUtil;
@@ -33,15 +38,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class App {
 
     // ===== 配置区 =====
-    private static final String UUID = "08431c4e-d071-40c2-872b-85f7049f5d80";
-    private static final int LISTEN_PORT = 24614;   // 面板分配的端口
-    private static final String WS_PATH = "/wszxl";    // WebSocket 路径
-    private static final String SUB_PATH = "/sub";  // 获取节点链接的私密路径
+    private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
+    private static final int LISTEN_PORT = 24614;   // 你的面板分配端口
+    private static final String WS_PATH = "/ws";    // WebSocket 路径
     // ==================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
     private static final String PROTOCOL_UUID = UUID.replace("-", "");
-    private static volatile String cachedIp = null;
 
     private static final List<String> BLOCKED_DOMAINS = Arrays.asList(
             "speedtest.net", "fast.com", "speedtest.cn", "speed.cloudflare.com",
@@ -52,10 +55,6 @@ public class App {
     private static EventLoopGroup bossGroup;
     private static EventLoopGroup workerGroup;
     private static Channel serverChannel;
-
-    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(4))
-            .build();
 
     public static void main(String[] args) {
         start();
@@ -71,6 +70,9 @@ public class App {
     public static void start() {
         if (!RUNNING.compareAndSet(false, true)) return;
 
+        // 开机唯一一次：获取真实 IP 并打印节点链接
+        fetchRealIpAndPrintNode();
+
         try {
             bossGroup = new NioEventLoopGroup(1);
             workerGroup = new NioEventLoopGroup();
@@ -82,11 +84,9 @@ public class App {
                         @Override
                         protected void initChannel(SocketChannel ch) {
                             ChannelPipeline p = ch.pipeline();
-                            // 45秒无读写自动断开，防止MC面板内存泄露
                             p.addLast(new IdleStateHandler(45, 45, 0));
                             p.addLast(new HttpServerCodec());
                             p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new SubHttpHandler());
                             p.addLast(new WebSocketServerProtocolHandler(WS_PATH, null, false));
                             p.addLast(new WebSocketFrameAggregator(16 * 1024 * 1024));
                             p.addLast(new WebSocketProxyHandler());
@@ -115,78 +115,49 @@ public class App {
             }
             if (bossGroup != null) bossGroup.shutdownGracefully();
             if (workerGroup != null) workerGroup.shutdownGracefully();
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
     }
 
-    // --- 异步获取真实 IP 并输出订阅 ---
-    static class SubHttpHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
-            String uri = req.uri();
-
-            if (SUB_PATH.equals(uri)) {
-                if (cachedIp != null) {
-                    sendResponse(ctx, cachedIp);
-                    return;
-                }
-
-                // 异步拉取 IP，不阻塞 Netty Worker 线程
-                HttpRequest ipReq = HttpRequest.newBuilder()
+private static void fetchRealIpAndPrintNode() {
+        new Thread(() -> {
+            try {
+                HttpRequest request = HttpRequest.newBuilder()
                         .uri(URI.create("https://api-ipv4.ip.sb/ip"))
-                        .timeout(Duration.ofSeconds(4))
+                        .timeout(Duration.ofSeconds(5))
                         .build();
+                HttpResponse<String> response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() == 200) {
+                    String realIp = response.body().trim();
+                    String vlessUrl = String.format(
+                            "vless://%s@%s:%d?encryption=none&security=none&type=ws&host=&path=%s#MC_HiddenNode",
+                            UUID, realIp, LISTEN_PORT, WS_PATH.replace("/", "%2F")
+                    );
+                    
+                    // 打印节点信息
+                    System.out.println("==================================================");
+                    System.out.println("宿主机真实IP: " + realIp);
+                    System.out.println("⚠️ 请在 30 秒内复制以下节点链接 (随后将自动销毁清屏):");
+                    System.out.println(vlessUrl);
+                    System.out.println("==================================================");
 
-                HTTP_CLIENT.sendAsync(ipReq, HttpResponse.BodyHandlers.ofString())
-                        .thenAccept(resp -> {
-                            if (resp.statusCode() == 200) {
-                                cachedIp = resp.body().trim();
-                                sendResponse(ctx, cachedIp);
-                            } else {
-                                sendResponse(ctx, "Fetch_IP_Failed");
-                            }
-                        })
-                        .exceptionally(ex -> {
-                            sendResponse(ctx, "Fetch_IP_Error");
-                            return null;
-                        });
-            } else if (!uri.startsWith(WS_PATH)) {
-                // 伪装 404，防止被轻易探测
-                FullHttpResponse response = new DefaultFullHttpResponse(
-                        HttpVersion.HTTP_1_1, HttpResponseStatus.NOT_FOUND,
-                        Unpooled.copiedBuffer("404 Not Found", StandardCharsets.UTF_8));
-                ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
-            } else {
-                req.retain();
-                ctx.fireChannelRead(req);
+                    // 倒计时 30 秒给用户复制的时间
+                    Thread.sleep(10000);
+                    
+                    // 发送清屏指令，清空控制台面板
+                    System.out.print("\033[H\033[2J");
+                    System.out.flush();
+                    
+                    // 清屏后，打印一句极其普通的 MC 原版开机日志作为伪装
+                    System.out.println("[Server thread/INFO]: Done (30.123s)! For help, type \"help\"");
+                }
+            } catch (Exception e) {
+                // 如果获取失败，什么都不打印，绝对静默
             }
-        }
-
-        private void sendResponse(ChannelHandlerContext ctx, String ip) {
-            String vlessUrl = String.format(
-                    "vless://%s@%s:%d?encryption=none&security=none&type=ws&host=&path=%s#MC_Node\n",
-                    UUID, ip, LISTEN_PORT, WS_PATH.replace("/", "%2F")
-            );
-            FullHttpResponse response = new DefaultFullHttpResponse(
-                    HttpVersion.HTTP_1_1, HttpResponseStatus.OK,
-                    Unpooled.copiedBuffer(vlessUrl, StandardCharsets.UTF_8));
-            response.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=UTF-8");
-            response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
-            ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
-        }
-
-        @Override
-        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
-            if (evt instanceof IdleStateEvent) {
-                ctx.close();
-            }
-        }
+        }).start();
     }
-
-    // --- 代理核心逻辑 ---
+    // --- 代理核心逻辑 (纯内存运行) ---
     static class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
         private static final long MAX_PENDING_BYTES = 2L * 1024 * 1024;
-
         private Channel outboundChannel;
         private boolean connected = false;
         private boolean connecting = false;
@@ -198,7 +169,6 @@ public class App {
         protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
             if (frame instanceof BinaryWebSocketFrame) {
                 ByteBuf content = frame.content();
-
                 if (!protocolIdentified) {
                     byte[] data = new byte[content.readableBytes()];
                     content.getBytes(content.readerIndex(), data);
@@ -222,17 +192,13 @@ public class App {
                 return;
             }
             outboundChannel.write(data).addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) {
-                    closeBoth(ctx);
-                }
+                if (!future.isSuccess()) closeBoth(ctx);
             });
         }
 
         @Override
         public void channelReadComplete(ChannelHandlerContext ctx) {
-            if (outboundChannel != null && outboundChannel.isActive()) {
-                outboundChannel.flush();
-            }
+            if (outboundChannel != null && outboundChannel.isActive()) outboundChannel.flush();
             ctx.fireChannelReadComplete();
         }
 
@@ -257,32 +223,22 @@ public class App {
                 ByteBuf data = pendingOutboundWrites.poll();
                 pendingOutboundBytes -= data.readableBytes();
                 outboundChannel.write(data).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) {
-                        closeBoth(ctx);
-                    }
+                    if (!future.isSuccess()) closeBoth(ctx);
                 });
             }
-            if (outboundChannel != null) {
-                outboundChannel.flush();
-            }
+            if (outboundChannel != null) outboundChannel.flush();
         }
 
         private void releasePendingOutbound() {
             ByteBuf data;
-            while ((data = pendingOutboundWrites.poll()) != null) {
-                data.release();
-            }
+            while ((data = pendingOutboundWrites.poll()) != null) data.release();
             pendingOutboundBytes = 0;
         }
 
         private void closeBoth(ChannelHandlerContext ctx) {
             releasePendingOutbound();
-            if (outboundChannel != null && outboundChannel.isOpen()) {
-                outboundChannel.close();
-            }
-            if (ctx.channel().isOpen()) {
-                ctx.close();
-            }
+            if (outboundChannel != null && outboundChannel.isOpen()) outboundChannel.close();
+            if (ctx.channel().isOpen()) ctx.close();
         }
 
         private void handleFirstMessage(ChannelHandlerContext ctx, byte[] data) {
@@ -329,7 +285,7 @@ public class App {
                 if (offset + 1 > data.length) return false;
 
                 byte command = data[offset];
-                if (command != 0x01) return false; // 0x01 = TCP
+                if (command != 0x01) return false;
                 offset++;
                 if (offset + 2 > data.length) return false;
 
@@ -344,9 +300,7 @@ public class App {
 
                 if (atyp == 0x01) {
                     if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d",
-                            data[offset] & 0xFF, data[offset + 1] & 0xFF,
-                            data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
+                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
                     addressLength = 4;
                 } else if (atyp == 0x02) {
                     if (offset >= data.length) return false;
@@ -375,7 +329,6 @@ public class App {
                     return false;
                 }
 
-                // VLESS 响应头：0x00 代表版本，0x00 代表附加信息长度为 0
                 ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{0x00, 0x00})));
 
                 final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
@@ -401,9 +354,7 @@ public class App {
 
                 if (atyp == 0x01) {
                     if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d",
-                            data[offset] & 0xFF, data[offset + 1] & 0xFF,
-                            data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
+                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
                     addressLength = 4;
                 } else if (atyp == 0x03) {
                     if (offset >= data.length) return false;
@@ -456,9 +407,7 @@ public class App {
 
                 if (atyp == 0x01) {
                     if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d",
-                            data[offset] & 0xFF, data[offset + 1] & 0xFF,
-                            data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
+                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
                     addressLength = 4;
                 } else if (atyp == 0x03) {
                     if (offset >= data.length) return false;
@@ -556,9 +505,7 @@ public class App {
 
         @Override
         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
-            if (evt instanceof IdleStateEvent) {
-                closeBoth(ctx);
-            }
+            if (evt instanceof IdleStateEvent) closeBoth(ctx);
         }
 
         @Override
@@ -585,9 +532,7 @@ public class App {
         public void channelActive(ChannelHandlerContext ctx) {
             if (remainingData != null && remainingData.length > 0) {
                 ctx.writeAndFlush(Unpooled.wrappedBuffer(remainingData)).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) {
-                        ctx.close();
-                    }
+                    if (!future.isSuccess()) ctx.close();
                 });
             }
         }
@@ -600,9 +545,7 @@ public class App {
                     if (inboundChannel.isActive()) {
                         inboundChannel.write(new BinaryWebSocketFrame(buf.retain()))
                                 .addListener((ChannelFutureListener) future -> {
-                                    if (!future.isSuccess()) {
-                                        ctx.close();
-                                    }
+                                    if (!future.isSuccess()) ctx.close();
                                 });
                     } else {
                         ctx.close();
@@ -615,25 +558,19 @@ public class App {
 
         @Override
         public void channelReadComplete(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) {
-                inboundChannel.flush();
-            }
+            if (inboundChannel.isActive()) inboundChannel.flush();
             ctx.fireChannelReadComplete();
         }
 
         @Override
         public void channelWritabilityChanged(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) {
-                inboundChannel.config().setAutoRead(ctx.channel().isWritable());
-            }
+            if (inboundChannel.isActive()) inboundChannel.config().setAutoRead(ctx.channel().isWritable());
             ctx.fireChannelWritabilityChanged();
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) {
-                inboundChannel.close();
-            }
+            if (inboundChannel.isActive()) inboundChannel.close();
         }
 
         @Override
@@ -646,8 +583,7 @@ public class App {
         int len = s.length();
         byte[] data = new byte[len / 2];
         for (int i = 0; i < len; i += 2) {
-            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
-                    + Character.digit(s.charAt(i + 1), 16));
+            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4) + Character.digit(s.charAt(i + 1), 16));
         }
         return data;
     }
@@ -669,7 +605,6 @@ public class App {
     private static boolean isBlockedDomain(String host) {
         if (host == null || host.isEmpty()) return false;
         String hostLower = host.toLowerCase();
-        return BLOCKED_DOMAINS.stream().anyMatch(blocked ->
-                hostLower.equals(blocked) || hostLower.endsWith("." + blocked));
+        return BLOCKED_DOMAINS.stream().anyMatch(blocked -> hostLower.equals(blocked) || hostLower.endsWith("." + blocked));
     }
 }
